@@ -1,0 +1,9 @@
+# crates.io 换 rsproxy 镜像（索引 + 下载都走镜像；仅对本项目生效，不碰全局 ~/.cargo）
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 5

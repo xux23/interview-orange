@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"主窗与浮窗：页面来自本地服务（http://127.0.0.1:8756），Tauri v2 对远程域默认禁 IPC，须显式放行","remote":{"urls":["http://127.0.0.1:*","http://localhost:*"]},"local":true,"windows":["main","overlay"],"permissions":["core:default","shell-ipc"]}}

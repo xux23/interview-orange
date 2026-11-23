@@ -1,0 +1,31 @@
+# ── 依赖 / 工具链（体积大，不入库）──
+node_modules/
+.tools/
+.tmp-build/
+native/target/
+
+# ── 本地配置（含 API Key，绝不入库）──
+.env
+.env.local
+
+# ── 构建产物（npm run build 生成）──
+public/
+
+# ── 运行时数据（DB / 截图 / 上传 / WebView 缓存）──
+data/app.db
+data/app.db-shm
+data/app.db-wal
+data/screenshots/
+data/webview/
+data/uploads/
+data/disguise/
+data/.recovery
+
+# ── 取证截图（保留测试用的示例图）──
+shots/*
+!shots/exam.png
+
+# ── 杂项 ──
+*.log
+.DS_Store
+Thumbs.db

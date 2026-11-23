@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "shell-ipc"
+description = "允许主窗/浮窗页面（本地服务来源）调用壳的 IPC 命令"
+commands.allow = ["ipc", "probe_result", "diag_box"]
