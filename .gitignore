@@ -29,3 +29,7 @@ shots/*
 *.log
 .DS_Store
 Thumbs.db
+
+# ── 联调临时目录（不入库）──
+.tmp-hotkey/
+.tmp-review-data/

@@ -6,25 +6,25 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { Server } from 'socket.io';
 import { one, all, run } from './db.js';
-import { cuid, chunkText, fromJson, toJson, nowIso } from './util.js';
-import { config, isPro } from './config.js';
-import { verifyToken } from './auth.js';
-import { interviewStream, examSolveStream, mockNextQuestion, mockReaction, loadResume, loadGoal, loadMaterials, reportFor } from './ai/pipeline.js';
-import { insertMessage, insertTranscript, sessionDto } from './trpc/session.js';
+import { cuid, chunkText, fromJson, toJson, nowIso, pruneDir } from './util.js';
+import { config } from './config.js';
+import { singleUser } from './auth.js';
+import { interviewStream, examSolveStream, mockNextQuestion, mockReaction, loadResume, loadGoal, loadMaterials } from './ai/pipeline.js';
+import { insertMessage, insertTranscript, finalizeSession } from './trpc/session.js';
 import { buildKnowledge } from './ai/prompts.js';
 import { asrEnabled, pcmPeak, transcribe } from './ai/asr.js';
 import { openaiComplete, providerName } from './ai/provider.js';
+import { sniffImage } from './ai/enrich.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function authenticate(data) {
-  const token = data?.token || '';
-  const payload = verifyToken(token);
-  if (!payload) return { error: 'UNAUTHORIZED', message: '登录已失效，请重新登录' };
-  const user = one('SELECT * FROM users WHERE id=?', payload.userId);
-  if (!user) return { error: 'NOT_FOUND', message: '用户不存在' };
+/** 账号模块已移除：本地单一档案用户，免登录、免 token */
+function authenticate() {
+  const user = singleUser();
+  if (!user) return { error: 'NOT_FOUND', message: '本地档案未初始化：请先运行 npm run seed' };
   return { user };
 }
 
@@ -47,15 +47,37 @@ async function streamTo(emit, startEvent, deltaEvent, endEvent, payload, generat
   return acc;
 }
 
-export function attachSocket(httpServer) {
+export function attachSocket(httpServer, { socketToken: tokenIn } = {}) {
+  /* ── 高危3：收紧 Socket.IO 暴露面 ──
+   * 1) CORS/握手 Origin 只允许本机服务自己的 origin（127.0.0.1:<port> / localhost:<port>）；
+   * 2) token 由服务入口生成（写入数据目录 + 经 /healthz 下发给自家 UI），
+   *    root 与 /desktop 两个 namespace 的握手 auth 都必须带对，否则任何网页都能直连驱动 exam.solve。 */
+  const socketToken = tokenIn || crypto.randomBytes(24).toString('hex');
+  const allowedOrigins = new Set([
+    `http://127.0.0.1:${config.port}`,
+    `http://localhost:${config.port}`,
+    `http://${config.host}:${config.port}`,
+  ]);
+  const originOk = (origin) => !origin || allowedOrigins.has(origin);
+  const tokenOk = (auth) => auth?.socketToken === socketToken;
+
   const io = new Server(httpServer, {
     path: '/socket.io',
-    cors: { origin: true, credentials: false },
+    cors: {
+      origin: (origin, cb) => (originOk(origin) ? cb(null, true) : cb(new Error('origin not allowed'))),
+      credentials: false,
+    },
+    // websocket upgrade 不走 CORS 中间件：allowRequest 里再校验一次握手 Origin
+    // （engine.io 回调是 error-first：(err, success)）
+    allowRequest: (req, fn) => fn(null, originOk(req.headers.origin)),
     transports: ['websocket', 'polling'],
+    // P1：大屏截图（base64）可能超过默认 1MB；显式放宽并在此上限处截断
+    maxHttpBufferSize: 32 * 1024 * 1024,
   });
 
   /* ───────────────── 面试（root namespace） ───────────────── */
   io.of('/').use((socket, next) => {
+    if (!tokenOk(socket.handshake.auth)) return next(new Error('未授权的 socket 连接（token 缺失或不匹配）'));
     const auth = authenticate(socket.handshake.auth || {});
     if (auth.error) return next(new Error(auth.message));
     const sessionId = socket.handshake.auth?.sessionId;
@@ -69,6 +91,9 @@ export function attachSocket(httpServer) {
     socket.data.turn = 0;
     next();
   });
+
+  // P1-7：会话级 mock.start 幂等表（sessionId → 首次开始时间）
+  const mockStartedAt = new Map();
 
   io.of('/').on('connection', (socket) => {
     const session = socket.data.session;
@@ -92,9 +117,11 @@ export function attachSocket(httpServer) {
       const c = ctx();
       let q = '';
       if (providerName() === 'openai') {
-        // 真实出题：按岗位/简历/轮次生成，带已问列表防重复；失败回退题库
+        // 真实出题：按岗位/简历/轮次生成，带已问列表防重复；失败直接报错（不再回退题库）
+        socket.data.asked = socket.data.asked || [];
+        const gen = new AbortController();
+        socket.data.genCtrl = gen; // ai.interrupt 真打断
         try {
-          socket.data.asked = socket.data.asked || [];
           const r = await openaiComplete({
             system:
               `你是「${c.goal?.name || '技术'}」岗位的资深面试官，正在面试候选人（简历：${c.resume?.title || '未提供'}）。` +
@@ -103,13 +130,19 @@ export function attachSocket(httpServer) {
               (socket.data.asked.length ? `已问过的问题（严禁重复或变体重复）：${socket.data.asked.join('；')}` : ''),
             messages: [{ role: 'USER', content: '请出下一道面试题。' }],
             maxTokens: 200,
+            signal: gen.signal,
           });
           q = r.text.trim().replace(/^["'「\s]+|["'」\s]+$/g, '').split('\n')[0];
+          if (!q) throw new Error('模型返回了空题目');
         } catch (e) {
-          console.warn('[ask] 真实出题失败，回退题库:', e.message);
+          if (socket.data.genCtrl === gen) socket.data.genCtrl = null;
+          if (e.aborted) return null; // 用户打断：ai.interrupted 已由事件处理器发出
+          console.error('[ask] 真实出题失败:', e.message);
+          push('ai.error', { turn, stage: 'question', message: `出题失败：${e.message}` });
+          return null;
         }
-      }
-      if (!q) {
+        if (socket.data.genCtrl === gen) socket.data.genCtrl = null;
+      } else {
         q = mockNextQuestion({
           goal: c.goal,
           round: session.round || 'FIRST',
@@ -134,32 +167,54 @@ export function attachSocket(httpServer) {
       return text;
     }
 
+    /** 多轮历史（对齐官方 05 号：我说出口的话包 <my_spoken_answer>；取最近几轮做上文）。
+     *  本轮问题在 assist 前已落库，先去掉避免与 <USER_MESSAGE> 重复。 */
+    function buildHistory(currentQuestion) {
+      const rows = all('SELECT role, content FROM messages WHERE session_id=? AND role IN (?,?) ORDER BY created_at DESC LIMIT 8', sessionId, 'INTERVIEWER', 'USER').reverse();
+      while (rows.length && rows[rows.length - 1].role === 'INTERVIEWER' && rows[rows.length - 1].content === currentQuestion) rows.pop();
+      return rows.map((m) => (
+        m.role === 'USER'
+          ? { role: 'USER', content: `<my_spoken_answer>\n${m.content}\n</my_spoken_answer>` }
+          : { role: 'USER', content: `<USER_MESSAGE>\n${m.content}\n</USER_MESSAGE>` }
+      ));
+    }
+
     async function assist(question, c) {
       push('ai.onMsg', { turn: socket.data.turn, role: 'ASSISTANT', ts: nowIso() });
-      // 文档 20：遇到说不清的技术名词先搜（前端据此显示检索状态）
-      const tech = /(MySQL|Redis|Kafka|Kubernetes|Flink|gRPC|HTTP\/2|B\+ ?树|MVCC|RocketMQ|Elasticsearch)/.exec(String(question));
-      if (tech && metadata.webSearch !== false) {
-        push('ai.webSearch', { turn: socket.data.turn, query: tech[1], status: 'start' });
-        await sleep(160);
-        push('ai.webSearch', { turn: socket.data.turn, query: tech[1], status: 'done', results: 3 });
-      }
       push('ai.turnKind', { turn: socket.data.turn, kind: 'answer' });
-      push('ai.messageStart', '');
-      const text = await streamTo(
-        (ev, p) => push(ev, p),
-        'ai.messageStart', 'ai.message', 'ai.messageEnd',
-        { start: '', end: '' },
-        interviewStream({
-          userId: session.user_id,
-          question,
-          lang: metadata.lang || 'zh-CN',
-          styleValue: metadata.answerStyle || 'natural',
-          resumeId: session.resume_id,
-          goalId: session.goal_id,
-          materialIds: metadata.materialIds || [],
-          history: [],
-        }),
-      );
+      // 注：messageStart 由 streamTo 统一发射，这里不再重复 push
+      const gen = new AbortController();
+      socket.data.genCtrl = gen; // ai.interrupt 真打断
+      let text = '';
+      try {
+        text = await streamTo(
+          (ev, p) => push(ev, p),
+          'ai.messageStart', 'ai.message', 'ai.messageEnd',
+          { start: '', end: '' },
+          interviewStream({
+            userId: session.user_id,
+            question,
+            lang: metadata.lang || 'zh-CN',
+            styleValue: metadata.answerStyle || 'natural',
+            customStyle: metadata.customAnswerStyle || metadata.instructionsPrompt || '',
+            resumeId: session.resume_id,
+            goalId: session.goal_id,
+            materialIds: metadata.materialIds || [],
+            history: buildHistory(question),
+            signal: gen.signal,
+          }),
+        );
+      } catch (e) {
+        // 模型失败/超时：直接报错给前端；用户主动打断（e.aborted）只复位流式状态，不报错
+        if (!e.aborted) {
+          console.error('[assist] AI 生成失败:', e.message);
+          push('ai.error', { turn: socket.data.turn, stage: 'answer', message: `AI 生成失败：${e.message}` });
+        }
+        push('ai.messageEnd', '');
+        return null;
+      } finally {
+        if (socket.data.genCtrl === gen) socket.data.genCtrl = null;
+      }
       insertMessage(sessionId, 'ASSISTANT', text, { turn: socket.data.turn });
       insertTranscript(sessionId, 'self', text, { utteranceId: `a-${socket.data.turn}` });
       run('UPDATE sessions SET updated_at=? WHERE id=?', nowIso(), sessionId);
@@ -187,16 +242,22 @@ export function attachSocket(httpServer) {
 
     socket.on('mock.join', () => socket.emit('mock.joined', { sessionId }));
     socket.on('mock.start', async () => {
+      // P1-7：按会话幂等——重连/重复 start 不重置轮次、不重新出第一题
+      const startedAt = mockStartedAt.get(sessionId);
+      if (startedAt && Date.now() - startedAt < 10 * 60 * 1000) {
+        socket.emit('mock.started', { sessionId, resumed: true });
+        return;
+      }
+      mockStartedAt.set(sessionId, Date.now());
       push('ai.prewarm', { sessionId, ts: nowIso() });
       socket.emit('mock.started', { sessionId });
       await ask(0);
       socket.data.turn = 1;
     });
 
-    /* 文档 23：打断 / 合并上一轮 / 音频权限请求 */
-    socket.data.interrupted = false;
+    /* 文档 23：打断 / 合并上一轮 / 音频权限请求（interrupt 真掐断当前生成） */
     socket.on('ai.interrupt', (payload = {}) => {
-      socket.data.interrupted = true;
+      socket.data.genCtrl?.abort();
       push('ai.interrupted', { turn: socket.data.turn, reason: payload.reason || 'user' });
     });
     socket.on('ai.mergePrev', (payload = {}) => {
@@ -216,8 +277,17 @@ export function attachSocket(httpServer) {
      * ASR 启用（.env 配 ML_ASR_API_KEY）：能量 VAD 切句 → ai/asr.js 整句转写 → 事件流 + 落库
      *   speakerId='self' → 用户语音作答；其他（Guest-1 等）→ 面试官问题，触发 AI 辅助
      * ASR 未启用：本地替身保留（stt.start 定时出题 / stt.data 攒 8KB 出题 / stt.inject 注文本）
+     *   其中 self 是本人语音，mock 下没有真实转写，直接丢弃，绝不伪造为面试官问题
      */
-    const sttState = { pending: false, utteranceId: null, bytes: 0 };
+    const mockSttStates = new Map(); // speakerId → { pending, utteranceId, bytes }
+    const mockSttOf = (speakerId) => {
+      let st = mockSttStates.get(speakerId);
+      if (!st) {
+        st = { pending: false, utteranceId: null, bytes: 0 };
+        mockSttStates.set(speakerId, st);
+      }
+      return st;
+    };
     const SPEECH_PEAK = 0.02; // 归一化峰值阈值 ≈ -34dBFS
     // 按说话人分离的 VAD 状态：面试官（Guest-1，系统共享音频）与本人（self，麦克风）
     // 两路采集各自独立缓冲/收句，同时说话也互不混音、不串说话人
@@ -289,38 +359,49 @@ export function attachSocket(httpServer) {
       }
     }
 
+    /** 音频帧解码：兼容二进制帧（Uint8Array/ArrayBuffer，省 33% 带宽）与旧 base64 字符串 */
+    const toChunk = (raw) => {
+      if (typeof raw === 'string') {
+        if (!raw) return null;
+        try { return Buffer.from(raw, 'base64'); } catch { return null; }
+      }
+      if (raw instanceof ArrayBuffer) return Buffer.from(new Uint8Array(raw));
+      if (ArrayBuffer.isView(raw)) return Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+      return null;
+    };
+
     socket.on('stt.data', async (payload = {}) => {
-      const data = String(payload.data || '');
-      if (!data) return;
+      const chunk = toChunk(payload?.data);
+      if (!chunk || !chunk.length) return;
+      const speakerId = payload.speakerId || 'Guest-1';
       if (!asrEnabled()) {
-        // ── 本地替身（无 ASR key）：沿用 8KB 切句规则 ──
-        sttState.bytes += Math.floor((data.length * 3) / 4);
-        if (!sttState.pending) {
-          sttState.pending = true;
-          sttState.utteranceId = cuid(12);
-          push('stt.pending', { utteranceId: sttState.utteranceId, bytes: sttState.bytes });
+        // ── 本地替身（无 ASR key）：按说话人沿用 8KB 切句规则；self 无真实转写，直接丢弃 ──
+        if (speakerId === 'self') return;
+        const st = mockSttOf(speakerId);
+        st.bytes += chunk.length;
+        if (!st.pending) {
+          st.pending = true;
+          st.utteranceId = cuid(12);
+          push('stt.pending', { utteranceId: st.utteranceId, speakerId, bytes: st.bytes });
         }
         // 每累积 ~8KB 视为一句完成（真实实现按 VAD 切分）
-        if (sttState.bytes >= 8192) {
+        if (st.bytes >= 8192) {
           const text = mockNextQuestion({ goal: ctx().goal, round: session.round || 'FIRST', turn: socket.data.turn });
-          push('stt.speaker', { utteranceId: sttState.utteranceId, speakerId: payload.speakerId || 'Guest-1', confidence: 0.93 });
-          push('stt.segment', { speakerId: payload.speakerId || 'Guest-1', utteranceId: sttState.utteranceId, completed: true, text });
-          push('stt.changed', { utteranceId: sttState.utteranceId, speakerId: payload.speakerId || 'Guest-1' });
-          push('stt.turnEnd', { utteranceId: sttState.utteranceId, text });
-          insertMessage(sessionId, 'INTERVIEWER', text, { utteranceId: sttState.utteranceId });
-          insertTranscript(sessionId, payload.speakerId || 'Guest-1', text, { utteranceId: sttState.utteranceId });
-          sttState.pending = false;
-          sttState.bytes = 0;
+          push('stt.speaker', { utteranceId: st.utteranceId, speakerId, confidence: 0.93 });
+          push('stt.segment', { speakerId, utteranceId: st.utteranceId, completed: true, text });
+          push('stt.changed', { utteranceId: st.utteranceId, speakerId });
+          push('stt.turnEnd', { utteranceId: st.utteranceId, text });
+          insertMessage(sessionId, 'INTERVIEWER', text, { utteranceId: st.utteranceId });
+          insertTranscript(sessionId, speakerId, text, { utteranceId: st.utteranceId });
+          st.pending = false;
+          st.bytes = 0;
+          st.utteranceId = null;
           await assist(text, ctx());
           socket.data.turn += 1;
         }
         return;
       }
       // ── 真实 ASR：按说话人分离的能量 VAD 切句 ──
-      let chunk;
-      try { chunk = Buffer.from(data, 'base64'); } catch { return; }
-      if (!chunk.length) return;
-      const speakerId = payload.speakerId || 'Guest-1';
       const st = vadOf(speakerId);
       const now = Date.now();
       const speech = pcmPeak(chunk) >= SPEECH_PEAK;
@@ -350,7 +431,14 @@ export function attachSocket(httpServer) {
       socket.emit('mock.assistChanged', { assistMode: on });
     });
 
-    socket.on('mock.end', () => {
+    socket.on('mock.end', async () => {
+      // P1-7：先按 completeSession 同一逻辑收尾落库（status/报告/时长，幂等），再断开连接。
+      // 生成报告是 async，必须 await——不 await 的话前端立刻查状态仍是 ACTIVE。
+      try {
+        await finalizeSession(sessionId, socket.data.user.id);
+      } catch (e) {
+        console.error('[mock.end] 会话收尾失败:', e.message);
+      }
       socket.emit('mock.end', { sessionId });
       socket.disconnect(true);
     });
@@ -363,14 +451,21 @@ export function attachSocket(httpServer) {
         for (const st of vadStates.values()) st.gateMs = gate;
         return;
       }
+      const speakerId = payload.speakerId || 'Guest-1';
+      if (speakerId === 'self') return;
+      const st = mockSttOf(speakerId);
+      st.pending = false;
+      st.bytes = 0;
+      st.utteranceId = null;
       const utteranceId = cuid(12);
       await sleep(gate);
       const c = ctx();
       const text = mockNextQuestion({ goal: c.goal, round: session.round || 'FIRST', turn: socket.data.turn });
-      push('stt.segment', { speakerId: 'Guest-1', utteranceId, completed: false, text });
+      push('stt.segment', { speakerId, utteranceId, completed: false, text });
       await sleep(80);
-      push('stt.segment', { speakerId: 'Guest-1', utteranceId, completed: true, text });
-      insertMessage(sessionId, 'INTERVIEWER', text, { speakerId: 'Guest-1', utteranceId });
+      push('stt.segment', { speakerId, utteranceId, completed: true, text });
+      insertMessage(sessionId, 'INTERVIEWER', text, { speakerId, utteranceId });
+      insertTranscript(sessionId, speakerId, text, { utteranceId });
       await assist(text, c);
       socket.data.turn += 1;
     });
@@ -379,17 +474,30 @@ export function attachSocket(httpServer) {
       const text = String(payload.text || '').trim();
       if (!text) return;
       const utteranceId = cuid(12);
-      push('stt.segment', { speakerId: payload.speakerId || 'Guest-1', utteranceId, completed: true, text });
-      insertMessage(sessionId, payload.speakerId === 'self' ? 'USER' : 'INTERVIEWER', text, { injected: true });
-      await assist(text, ctx());
+      const speakerId = payload.speakerId || 'Guest-1';
+      push('stt.segment', { speakerId, utteranceId, completed: true, text });
+      if (speakerId === 'self') {
+        // 本人发言：与 VAD 收句一致，记录为作答，而不是当成面试官问题
+        await handleUserAnswer(text, { voice: true, utteranceId });
+      } else {
+        insertMessage(sessionId, 'INTERVIEWER', text, { injected: true, utteranceId });
+        insertTranscript(sessionId, speakerId, text, { injected: true, utteranceId });
+        await assist(text, ctx());
+        socket.data.turn += 1;
+      }
     });
 
     socket.on('stt.end', async (payload = {}) => {
       if (asrEnabled()) {
-        // 结束即冲刷所有说话人未收句的语音
+        // 结束即冲刷未收句的语音；带 speakerId 时只结束该路，避免截断另一路采集
         for (const [sid, st] of vadStates) {
+          if (payload.speakerId && sid !== payload.speakerId) continue;
           if (st.utteranceId) await finalizeUtterance(st, sid);
         }
+      } else if (payload.speakerId) {
+        mockSttStates.delete(payload.speakerId);
+      } else {
+        mockSttStates.clear();
       }
       socket.emit('stt.ended', { utteranceId: payload.utteranceId || null });
     });
@@ -401,6 +509,8 @@ export function attachSocket(httpServer) {
   const desktop = io.of('/desktop');
 
   desktop.use((socket, next) => {
+    // 高危3：/desktop 能驱动 exam.solve（模型调用/写库），同样必须带对启动 token
+    if (!tokenOk(socket.handshake.auth)) return next(new Error('未授权的 socket 连接（token 缺失或不匹配）'));
     const auth = authenticate(socket.handshake.auth || {});
     if (auth.error) return next(new Error(auth.message));
     socket.data.user = auth.user;
@@ -412,9 +522,6 @@ export function attachSocket(httpServer) {
     const peers = new Set(desktop.sockets.keys());
     desktop.emit('exam.peers', { secondaries: [...peers].filter((id) => id !== socket.id).slice(0, 3), primaries: [socket.id] });
 
-    const remaining = () => one('SELECT interview_time FROM users WHERE id=?', user.id)?.interview_time ?? 0;
-    const pro = () => isPro(one('SELECT * FROM users WHERE id=?', user.id));
-
     socket.on('exam.session.start', (payload = {}, ack) => {
       const customization = payload.customization || {};
       const id = cuid();
@@ -425,7 +532,8 @@ export function attachSocket(httpServer) {
         payload.platform || 'win32', payload.mode || 'quick', 0, 0, toJson([]), nowIso(), nowIso(),
       );
       socket.data.examSessionId = id;
-      const data = { sessionId: id, isPro: pro(), remainingMinutes: remaining(), customization };
+      // 账号/计费模块已移除：isPro/remainingMinutes 仅为 /legacy 原版前端显示兼容
+      const data = { sessionId: id, isPro: true, remainingMinutes: 9999, customization };
       if (typeof ack === 'function') ack({ success: true, data });
       socket.emit('exam.session', data);
       socket.emit('exam.sessionStarted', data);
@@ -435,15 +543,21 @@ export function attachSocket(httpServer) {
       const reqId = cuid(16);
       const examSessionId = payload.sessionId || socket.data.examSessionId || null;
       if (typeof ack === 'function') ack({ success: true, data: { reqId } });
+      socket.data.examGens = socket.data.examGens || new Map(); // reqId → AbortController（exam.abort 真打断）
+      const gen = new AbortController();
+      socket.data.examGens.set(reqId, gen);
 
-      // 截图落盘（独立目录），并保留最近 N 张便于复查
+      // 截图落盘 + 滚动清理（保留最近 200 张，防止目录无限增长）
       let screenshotPath = null;
       const shot = payload.screenshot || (payload.screenshots || [])[0];
       if (shot && typeof shot === 'string') {
         const base64 = shot.includes(',') ? shot.split(',').pop() : shot;
         try {
-          screenshotPath = path.join(config.screenshotsDir, `${reqId}.png`);
-          fs.writeFileSync(screenshotPath, Buffer.from(base64, 'base64'));
+          const buf = Buffer.from(base64, 'base64');
+          const ext = sniffImage(buf)?.ext || 'png';
+          screenshotPath = path.join(config.screenshotsDir, `${reqId}.${ext}`);
+          fs.writeFileSync(screenshotPath, buf);
+          pruneDir(config.screenshotsDir, 200);
         } catch {
           screenshotPath = null;
         }
@@ -458,28 +572,42 @@ export function attachSocket(httpServer) {
 
       let reasoning = '';
       let answer = '';
-      for await (const item of examSolveStream({
-        userId: user.id, questionText, screenshotPath, presetSlug,
-        mode: payload.mode || 'quick', customization, lang: customization.lang || 'zh-CN',
-      })) {
-        if (item.type === 'reasoning') {
-          reasoning += item.text;
-          socket.emit('exam.reasoning', { reqId, text: item.text });
-        } else {
-          answer += item.text;
-          socket.emit('exam.delta', { reqId, text: item.text });
+      try {
+        for await (const item of examSolveStream({
+          userId: user.id, questionText, screenshotPath, presetSlug,
+          mode: payload.mode || 'quick', customization, lang: customization.lang || 'zh-CN',
+          signal: gen.signal,
+        })) {
+          if (item.type === 'reasoning') {
+            reasoning += item.text;
+            socket.emit('exam.reasoning', { reqId, text: item.text });
+          } else {
+            answer += item.text;
+            socket.emit('exam.delta', { reqId, text: item.text });
+          }
         }
+      } catch (e) {
+        socket.data.examGens.delete(reqId);
+        if (e.aborted) {
+          socket.emit('exam.aborted', { reqId }); // 用户主动中止：非错误
+        } else {
+          // 真实模型失败/超时：直接报错（不扣费、不记录）
+          console.error('[exam] 解题失败:', e.message);
+          socket.emit('exam.error', { reqId, code: 'AI_ERROR', message: `解题失败：${e.message}` });
+        }
+        return;
+      }
+      socket.data.examGens.delete(reqId);
+
+      // 小项7：0 增量且没抛错时先报错返回——不发 exam.end（避免「先 end 后 error」把前端状态机带偏）
+      if (!answer) {
+        socket.emit('exam.error', { reqId, code: 'EMPTY_ANSWER', message: '未生成答案' });
+        return;
       }
       socket.emit('exam.end', { reqId });
 
       // 文档 23：错误统一走 exam.error
-      if (!answer) socket.emit('exam.error', { reqId, code: 'EMPTY_ANSWER', message: '未生成答案' });
-
-      // 计费：每次截屏答题扣 2 分钟（对齐实测 30 → 28）
-      const cur = remaining();
-      const next = Math.max(0, cur - config.limits.examMinutesPerSolve);
-      run('UPDATE users SET interview_time=? WHERE id=?', next, user.id);
-      socket.emit('exam.quota', { isPro: pro(), remainingMinutes: next, pendingCardHint: next < 4 });
+      socket.emit('exam.quota', { isPro: true, remainingMinutes: 9999, pendingCardHint: false });
 
       if (examSessionId) {
         const row = one('SELECT * FROM exam_sessions WHERE id=?', examSessionId);
@@ -518,7 +646,11 @@ export function attachSocket(httpServer) {
 
     socket.on('exam.answerNow', (payload = {}) => socket.emit('exam.answerNowAccepted', { reqId: payload.reqId }));
     socket.on('exam.resume', (payload = {}) => socket.emit('exam.resumed', { reqId: payload.reqId }));
-    socket.on('exam.abort', (payload = {}) => socket.emit('exam.aborted', { reqId: payload.reqId }));
+    socket.on('exam.abort', (payload = {}) => {
+      // 真打断：掐掉对应 reqId 的解题流（已吐出的部分答案保留）
+      socket.data.examGens?.get(payload.reqId || '')?.abort();
+      socket.emit('exam.aborted', { reqId: payload.reqId });
+    });
 
     socket.on('exam.session.complete', async (payload = {}, ack) => {
       const id = payload.sessionId || socket.data.examSessionId;
@@ -537,20 +669,6 @@ export function attachSocket(httpServer) {
   });
 
   return io;
-}
-
-/** 结束会话并生成报告（socket 场景复用；openai 模式为 LLM rubric） */
-export async function finalizeSession(sessionId, userId) {
-  const row = one('SELECT * FROM sessions WHERE id=? AND user_id=?', sessionId, userId);
-  if (!row || row.status === 'COMPLETED') return sessionDto(row);
-  const messages = all('SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC', sessionId)
-    .map((m) => ({ id: m.id, role: m.role, content: m.content, createdAt: m.created_at }));
-  const report = await reportFor(row, messages, { goal: loadGoal(userId, row.goal_id), resume: loadResume(userId, row.resume_id) });
-  const now = nowIso();
-  const realDuration = Math.max(1, Math.round((Date.now() - Date.parse(row.created_at)) / 1000));
-  run('UPDATE sessions SET status=?, completed_at=?, updated_at=?, real_duration=?, report=? WHERE id=?',
-    'COMPLETED', now, now, realDuration, toJson(report), sessionId);
-  return sessionDto(one('SELECT * FROM sessions WHERE id=?', sessionId));
 }
 
 export { buildKnowledge };

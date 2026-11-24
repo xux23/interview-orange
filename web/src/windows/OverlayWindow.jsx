@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { api, getToken, locale } from '../api/client';
+import { api, getToken, getSocketToken, locale } from '../api/client';
 import { createOverlayGate, publish, currentShowSeq } from '../lib/bridge';
 import { Markdown, cleanAnswerLabel, parseFollowups } from '../lib/markdown.jsx';
 import { closeOverlayWindow, hideOverlayWindow, isNative } from '../lib/native';
@@ -52,20 +52,39 @@ export default function OverlayWindow({ user }) {
     });
   };
 
+  // 小项6：卸载时清理防抖定时器
+  useEffect(() => () => clearTimeout(saveTimer.current), []);
+
   const flash = (msg) => { setToast(msg); setTimeout(() => setToast(''), 1400); };
 
   /* 门禁状态机：订阅主窗事件 + 兜底拉 seq */
   useEffect(() => {
     const g = createOverlayGate({
       onActivate: (state) => {
+        const prev = sessionRef.current;
+        // 新会话必须清掉上一场残留的卡片；同一会话重新显示时保留
+        if (state.sessionId && state.sessionId !== prev) setCards([]);
         setGate({ ...state });
-        sessionRef.current = state.sessionId || sessionRef.current;
-        if (state.sessionId) connect(state.sessionId);
-        if (state.mode === 'preview' || state.mode === 'interview-preview') setCards([]);
+        // P1-3：持久化会话标识——窗口隐藏/被关闭后经热键召回或重载，仍能接回原会话
+        if (state.sessionId) {
+          try { localStorage.setItem('overlay.session', JSON.stringify({ sessionId: state.sessionId, mode: state.mode })); } catch { /* ignore */ }
+        }
+        let persisted = null;
+        try { persisted = JSON.parse(localStorage.getItem('overlay.session') || 'null'); } catch { persisted = null; }
+        const rejoin = state.sessionId || prev || persisted?.sessionId || null;
+        sessionRef.current = rejoin;
+        if (state.sessionId) {
+          connect(state.sessionId);
+        } else if (rejoin && !socketRef.current && (state.mode === 'interview' || state.mode === 'exam')) {
+          // 热键召回的无 sessionId shown：socket 若已断，按持久化会话重连
+          connect(rejoin);
+        }
+        // P0-2：预览态只在「确实从有会话切到预览」时清卡片，窗口重新显示不再清
+        if ((state.mode === 'preview' || state.mode === 'interview-preview') && prev) setCards([]);
       },
       onHide: () => {
+        // P0-2：隐藏（显隐热键）≠ 会话结束——不断 socket，重新显示后流式继续
         setGate((s) => ({ ...s, active: false }));
-        disconnect();
       },
       onMode: (mode, patch, extra) => {
         if (mode) setGate((s) => ({ ...s, mode }));
@@ -75,6 +94,10 @@ export default function OverlayWindow({ user }) {
           if (extra.stage === 'reasoning') setExam((e) => ({ ...e, reasoning: e.reasoning + extra.text }));
           if (extra.stage === 'delta') setExam((e) => ({ ...e, answer: e.answer + extra.text }));
           if (extra.stage === 'end') setExam((e) => ({ ...e, active: false }));
+          if (extra.stage === 'error') {
+            setExam((e) => ({ ...e, active: false }));
+            flash(`⚠ ${extra.message || '解题失败'}`);
+          }
         }
         if (extra && extra.type === 'overlay-ai-text') {
           setInject(extra.text || '');
@@ -91,7 +114,7 @@ export default function OverlayWindow({ user }) {
     const onKey = (e) => {
       if (e.key === 'Escape') {
         const now = Date.now();
-        if (now - lastEsc < 400) { publish({ type: 'overlay-hidden' }); setGate((s) => ({ ...s, active: false })); disconnect(); hideOverlayWindow(); }
+        if (now - lastEsc < 400) { publish({ type: 'overlay-hidden' }); setGate((s) => ({ ...s, active: false })); hideOverlayWindow(); }
         lastEsc = now;
         return;
       }
@@ -116,51 +139,94 @@ export default function OverlayWindow({ user }) {
     return () => window.removeEventListener('keydown', onKey);
   }, []); // eslint-disable-line
 
+  /* 高危4：流式轮次独立成 streamRef（{qid, question, answer}），cards 只放已完成的轮次。
+   * questionStart → 新轮次；question → 只更新 streamRef.question；
+   * questionEnd → 用该 qid 落一张卡片（答案稍后经 ai.* 按同 qid 补上）；
+   * ai.message → 更新 streamRef.answer（无问题先到的答案只建一次轮次）；
+   * ai.messageEnd → 按 qid 找已提交卡片补 answer，找不到则整卡提交。 */
+  const streamRef = useRef(null);
+  const [streamView, setStreamView] = useState(null);
+  const qidSeq = useRef(0);
+
   function connect(sessionId) {
     disconnect();
-    if (!getToken() || !sessionId) return;
+    if (!sessionId) return; // 账号模块已移除：无需 token，有会话即连
     const socket = io('/', {
-      auth: { token: getToken(), locale: locale(), sessionId },
+      auth: { token: getToken(), socketToken: getSocketToken(), locale: locale(), sessionId },
       transports: ['websocket', 'polling'],
     });
     socketRef.current = socket;
-    let qBuf = '';
-    let aBuf = '';
+
+    const touch = () => setStreamView(streamRef.current ? { ...streamRef.current } : null);
+    const beginStream = (prefix) => {
+      if (streamRef.current) commitStream(); // 上一轮仍在流式：先收尾，避免轮次交叉
+      qidSeq.current += 1;
+      streamRef.current = { qid: `${prefix}-${Date.now()}-${qidSeq.current}`, question: '', answer: '' };
+      touch();
+    };
+    const commitStream = () => {
+      const s = streamRef.current;
+      if (!s) return;
+      streamRef.current = null;
+      touch();
+      if (!s.question && !s.answer) return;
+      setCards((c) => {
+        const idx = c.findIndex((card) => card.id === s.qid);
+        if (idx >= 0) {
+          const next = [...c];
+          next[idx] = { ...next[idx], answer: s.answer || next[idx].answer };
+          return next;
+        }
+        return [...c, { id: s.qid, question: s.question, answer: s.answer, at: new Date().toISOString() }];
+      });
+    };
+    const commitQuestion = () => {
+      const s = streamRef.current;
+      if (!s) return;
+      setCards((c) => [...c, { id: s.qid, question: s.question, answer: '', at: new Date().toISOString() }]);
+    };
 
     socket.on('connect_error', (err) => flash(`连接失败：${err.message}`));
 
-    socket.on('mock.questionStart', () => { qBuf = ''; });
-    socket.on('mock.question', (chunk) => { qBuf += chunk; setCards((c) => updateLast(c, { question: qBuf })); });
-    socket.on('mock.questionEnd', () => {
-      setCards((c) => [...c, { id: `q-${Date.now()}`, question: qBuf, answer: '', at: new Date().toISOString() }]);
+    socket.on('mock.questionStart', () => beginStream('q'));
+    socket.on('mock.question', (chunk) => {
+      if (!streamRef.current) beginStream('q'); // 没收到 Start 的兜底
+      streamRef.current.question += chunk;
+      touch();
     });
+    socket.on('mock.questionEnd', () => commitQuestion());
 
-    socket.on('ai.messageStart', () => { aBuf = ''; });
+    socket.on('ai.messageStart', () => {
+      // 答案先到（questionEnd 已落卡片并保留同轮次）或「无问题只有答案」：只建一次轮次
+      if (!streamRef.current) beginStream('a');
+    });
     socket.on('ai.message', (chunk) => {
-      aBuf += chunk;
-      setCards((c) => {
-        if (!c.length) return [{ id: `a-${Date.now()}`, question: '', answer: aBuf, at: new Date().toISOString() }];
-        return c.map((card, i) => (i === c.length - 1 ? { ...card, answer: aBuf } : card));
-      });
+      if (!streamRef.current) beginStream('a');
+      streamRef.current.answer += chunk;
+      touch();
     });
-    socket.on('ai.messageEnd', () => {
-      setCards((c) => {
-        if (c.length && !c[c.length - 1].question) {
-          return c.map((card, i) => (i === c.length - 1 ? { ...card, answer: aBuf } : card));
-        }
-        return [...c, { id: `a-${Date.now()}`, question: '', answer: aBuf, at: new Date().toISOString() }];
-      });
-    });
+    socket.on('ai.messageEnd', () => commitStream());
 
     socket.on('stt.segment', (seg) => {
-      if (seg.completed) {
-        qBuf = seg.text;
-        setCards((c) => [...c, { id: `q-${Date.now()}`, question: seg.text, answer: '', at: new Date().toISOString() }]);
-        aBuf = '';
+      // self 是自己的回答（服务端只记录，不触发辅助），不要当成面试官问题加卡片
+      if (seg.completed && seg.speakerId !== 'self') {
+        // 先收尾上一个仍在流式的轮次，再按「一次性提交」路径建本轮
+        commitStream();
+        qidSeq.current += 1;
+        const qid = `q-${Date.now()}-${qidSeq.current}`;
+        setCards((c) => [...c, { id: qid, question: seg.text, answer: '', at: new Date().toISOString() }]);
+        // 挂一个已提交的轮次，后续 ai.* 的答案按同 qid 补到这张卡片
+        streamRef.current = { qid, question: seg.text, answer: '' };
+        touch();
       }
     });
+    // 服务端模型失败直接推送错误（不再静默降级）：以错误卡片 + toast 呈现
+    socket.on('ai.error', (e) => {
+      const message = e?.message || 'AI 生成失败';
+      flash(`⚠ ${message}`);
+      setCards((c) => [...c, { id: `err-${Date.now()}`, question: '⚠ AI 出错', answer: message, at: new Date().toISOString() }]);
+    });
     socket.on('mock.end', () => flash('会话已结束'));
-    socket.on('overlay-style-hotkey-patch', (patch) => setStyle(patch));
   }
 
   function disconnect() {
@@ -240,16 +306,31 @@ export default function OverlayWindow({ user }) {
       try { window.moveBy(dx * px, dy * px); } catch { /* 浏览器忽略 */ }
     };
     const onDown = (e) => {
-      if (!e.altKey || !keys[e.key]) return;
+      if (e.repeat) return; // P1-5：OS 自动重复不重建定时器
+      // P1-6：Ctrl+Alt+方向键只调样式（上方热键），不移动窗口
+      if (!e.altKey || e.ctrlKey || !keys[e.key]) return;
       e.preventDefault();
       step(keys[e.key], 48); // 文档 03 §5：首次 48px
       clearInterval(timer);
       timer = setInterval(() => step(keys[e.key], 30), 30); // 之后每 30ms 步进 30px
     };
-    const onUp = () => { clearInterval(timer); timer = null; };
+    // P1-5：只在放开的确实是方向键时停；失焦/切窗（keyup 收不到）兜底清理
+    const onUp = (e) => {
+      if (keys[e.key]) { clearInterval(timer); timer = null; }
+    };
+    const stopAll = () => { clearInterval(timer); timer = null; };
+    const onVis = () => { if (document.hidden) stopAll(); };
     window.addEventListener('keydown', onDown);
     window.addEventListener('keyup', onUp);
-    return () => { clearInterval(timer); window.removeEventListener('keydown', onDown); window.removeEventListener('keyup', onUp); };
+    window.addEventListener('blur', stopAll);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('keydown', onDown);
+      window.removeEventListener('keyup', onUp);
+      window.removeEventListener('blur', stopAll);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   }, []);
 
   /* ── 文档 03 §4：auto-palette（捕捉 → suggestPalette → 应用 + undo 快照）── */
@@ -258,7 +339,8 @@ export default function OverlayWindow({ user }) {
     const nat = window.orangeNative;
     let image = null;
     try {
-      if (nat?.captureScreen) image = await nat.captureScreen();
+      // 配色采样 480px 足够：原生侧降采样后再传（IPC 体积从 ~16MB 降到 ~0.5MB）
+      if (nat?.captureScreen) image = await nat.captureScreen({ maxWidth: 480 });
     } catch { /* 落回浏览器路径 */ }
     if (!image) return flash('自动配色需要原生壳的截屏能力');
     paletteUndoRef.current = { ...styleRef.current };
@@ -275,6 +357,11 @@ export default function OverlayWindow({ user }) {
       });
       flash(`自动配色：${r.theme}（${r.sampled?.color || ''}）`);
     } catch (e) {
+      // P1-5：失败必须恢复原透明度快照，否则浮窗保持全透明不可见
+      if (paletteUndoRef.current) {
+        setStyle(paletteUndoRef.current);
+        paletteUndoRef.current = null;
+      }
       flash(`自动配色失败：${e.message}`);
     }
   };
@@ -299,7 +386,7 @@ export default function OverlayWindow({ user }) {
   useEffect(() => {
     const el = cardRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [cards, exam.answer]);
+  }, [cards, streamView, exam.answer]);
 
   return (
     <div
@@ -319,7 +406,7 @@ export default function OverlayWindow({ user }) {
         <span className="overlay-badge">{modeEmit(mode, gate)}</span>
         <div className="ov-drag">面试橙 · {isExam ? '笔试' : '面试'}</div>
         <button className="ov-btn" title="新建优先" onClick={() => setNewestFirst((v) => !v)}>{newestFirst ? '旧→新' : '新→旧'}</button>
-        <button className="ov-btn" title="隐藏浮窗（Ctrl+Alt+H 可召回）" onClick={() => { publish({ type: 'overlay-hidden' }); setGate((s) => ({ ...s, active: false })); disconnect(); hideOverlayWindow(); }}>—</button>
+        <button className="ov-btn" title="隐藏浮窗（Ctrl+Alt+H 可召回）" onClick={() => { publish({ type: 'overlay-hidden' }); setGate((s) => ({ ...s, active: false })); hideOverlayWindow(); }}>—</button>
         <button className="ov-btn" title="关闭浮窗（Ctrl+Alt+Shift+X）" onClick={() => { publish({ type: 'overlay-hidden' }); disconnect(); closeOverlayWindow(); }}>×</button>
       </div>
 
@@ -338,7 +425,7 @@ export default function OverlayWindow({ user }) {
         )}
 
         {!gate.active && mode === 'preview' && (
-          <div className="ov-card" style={{ borderLeft: '2px solid rgba(99,102,241,.5)' }}>
+          <div className="ov-card" style={{ borderLeft: '2px solid var(--accent)' }}>
             <div className="q">示例问题：请先做一个自我介绍</div>
             <Markdown className="a" text={DEMO_ANSWER} />
             <div className="ov-actions">
@@ -368,37 +455,56 @@ export default function OverlayWindow({ user }) {
 
         {gate.active && !isExam && (
           <>
-            {cardsView.length === 0 && <div className="ov-empty">最近答案会出现在这里<br /><span className="tiny">连接会话后逐字刷新</span></div>}
-            {cardsView.map((card) => (
-              <div className="ov-card" key={card.id} data-zone={"card-" + card.id} ref={(el) => window.__OVERLAY_DEBUG__?.registerZone?.(el)} style={{ borderLeft: '2px solid rgba(99,102,241,.5)' }}>
-                {card.question && <div className="q">{card.question}</div>}
-                {card.answer ? <Markdown className="a" text={card.answer} /> : <div className="q">生成中…</div>}
-                {card.answer && (
-                  <div className="ov-actions">
-                    <button className="ov-btn" onClick={() => copy(card.answer)}>复制</button>
-                  </div>
-                )}
+            {cardsView.length === 0 && !streamView && <div className="ov-empty">最近答案会出现在这里<br /><span className="tiny">连接会话后逐字刷新</span></div>}
+            {/* 仍在流式、尚未落卡片的轮次（问题识别中）实时显示 */}
+            {streamView && !cardsView.some((c) => c.id === streamView.qid) && (
+              <div className="ov-card" style={{ borderLeft: '2px solid var(--accent)' }} data-zone={'card-' + streamView.qid}>
+                <div className="q">{streamView.question || '识别问题中…'}<span className="muted">▍</span></div>
+                {streamView.answer && <Markdown className="a" text={streamView.answer} />}
               </div>
-            ))}
+            )}
+            {cardsView.map((card) => {
+              // 该卡片对应的轮次仍在流式：答案实时从 streamView 取
+              const live = streamView && streamView.qid === card.id ? streamView : null;
+              const answer = live ? live.answer : card.answer;
+              return (
+                <div className="ov-card" key={card.id} data-zone={"card-" + card.id} ref={(el) => window.__OVERLAY_DEBUG__?.registerZone?.(el)} style={{ borderLeft: '2px solid var(--accent)' }}>
+                  {card.question && <div className="q">{card.question}</div>}
+                  {answer ? <Markdown className="a" text={answer} /> : <div className="q">生成中…</div>}
+                  {answer && (
+                    <div className="ov-actions">
+                      <button className="ov-btn" onClick={() => copy(answer)}>复制</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </>
         )}
       </div>
 
       {gate.active && !isExam && (
-        <div style={{ padding: '4px 8px 8px', display: 'flex', gap: 6 }}>
+        <div className="ov-input-row">
           <input
             type="text"
             value={inject}
             onChange={(e) => setInject(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && injectQuestion()}
+            onKeyDown={(e) => {
+              if (e.nativeEvent.isComposing || e.keyCode === 229) return; // 小项5：IME 组合中不触发
+              if (e.key === 'Enter') injectQuestion();
+            }}
             placeholder="注入面试官问题（本地 STT 替身）"
-            style={{ flex: 1, fontSize: '11.5px', padding: '5px 8px', background: 'rgba(255,255,255,.7)', color: '#222' }}
+            style={{
+              background: theme === 'dark' ? 'rgba(18,22,27,.72)' : 'rgba(255,255,255,.78)',
+              color: fg,
+              borderColor: 'rgba(127,127,127,.35)',
+            }}
           />
           <button className="ov-btn" onClick={injectQuestion}>问</button>
         </div>
       )}
 
-      {toast && <div style={{ position: 'absolute', bottom: 8, left: 8, fontSize: 11, opacity: .75 }}>{toast}</div>}
+      {toast && <div className="ov-toast">{toast}</div>}
     </div>
   );
 }
@@ -406,11 +512,6 @@ export default function OverlayWindow({ user }) {
 function modeEmit(mode, gate) {
   const labels = { exam: '笔试', interview: '面试', preview: '预览', 'interview-preview': '预览' };
   return `${labels[mode] || mode} · #${gate.showSeq || currentShowSeq()}`;
-}
-
-function updateLast(cards, patch) {
-  if (!cards.length) return [{ id: `q-${Date.now()}`, question: patch.question || '', answer: '', at: new Date().toISOString() }];
-  return cards.map((c, i) => (i === cards.length - 1 ? { ...c, ...patch } : c));
 }
 
 function rgba2(hex, alpha) {
@@ -427,18 +528,32 @@ function copy(text) {
 }
 
 function startDrag(e) {
-  if (isNative || e.target.closest('button, input')) return;
+  if (e.target.closest('button, input')) return;
   const sx = e.clientX;
   const sy = e.clientY;
-  const move = (ev) => {
-    try { window.moveBy(ev.clientX - sx, ev.clientY - sy); } catch { /* 浏览器不允许时忽略 */ }
-  };
+  const nat = window.orangeNative;
+  publish({ type: 'drag-mode-changed', active: true });
+  let move;
   const up = () => {
     window.removeEventListener('pointermove', move);
     window.removeEventListener('pointerup', up);
     publish({ type: 'drag-mode-changed', active: false });
   };
+  if (nat?.winRect && nat?.winPosition) {
+    // 原生壳：WebView2 不支持 window.moveBy，经 IPC 按指针增量移动窗口
+    // （窗口随指针移动后，指针下的 clientX 基本不动，天然形成「拖到哪跟到哪」的稳定模型）
+    let base = null;
+    nat.winRect('overlay').then((r) => { base = r; }).catch(() => {});
+    move = (ev) => {
+      if (!base) return;
+      nat.winPosition({ x: base.x + (ev.clientX - sx), y: base.y + (ev.clientY - sy), w: base.w, h: base.h }).catch(() => {});
+    };
+  } else {
+    // 浏览器：moveBy 仅对脚本打开的弹窗有效
+    move = (ev) => {
+      try { window.moveBy(ev.clientX - sx, ev.clientY - sy); } catch { /* 浏览器不允许时忽略 */ }
+    };
+  }
   window.addEventListener('pointermove', move);
   window.addEventListener('pointerup', up);
-  publish({ type: 'drag-mode-changed', active: true });
 }

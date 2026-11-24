@@ -1,6 +1,7 @@
 /**
  * 语音采集（浏览器）：getUserMedia / getDisplayMedia → AudioWorklet 重采样到 16k →
- * PCM16 mono base64 帧 → socket.emit('stt.data', { data, speakerId })。
+ * PCM16 mono 帧 → socket.emit('stt.data', { data: <Uint8Array>, speakerId })。
+ * 二进制帧（省 33% 带宽与编解码 CPU）；服务端同时兼容旧 base64 字符串。
  *
  * 用法：
  *   const stop = await startVoiceCapture({ socket, speakerId: 'self', onLevel, onError });
@@ -38,27 +39,45 @@ function bufToB64(buf) {
   return btoa(bin);
 }
 
+/** PCM 帧编码：优先二进制（socket.io 原生支持 TypedArray，省 33%）；不支持时回落 base64 */
+const supportsBinary = (() => {
+  try { return typeof Uint8Array === 'function' && Boolean(new Uint8Array(1)); } catch { return false; }
+})();
+const encodeFrame = (buf) => (supportsBinary ? new Uint8Array(buf) : bufToB64(buf));
+
 export async function startVoiceCapture({ socket, speakerId = 'self', system = false, onLevel, onError } = {}) {
   if (!socket) throw new Error('socket 未连接');
   if (!navigator.mediaDevices) throw new Error('当前环境不支持媒体采集（需 Chromium 系浏览器或桌面端）');
 
   const ctx = new AudioContext({ sampleRate: 16000 });
-  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' })));
+  let moduleUrl = null;
+  let stream = null;
+  try {
+    moduleUrl = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
+    await ctx.audioWorklet.addModule(moduleUrl);
 
-  let stream;
-  if (system) {
-    // 共享标签页/整个屏幕的声音（面试官说话声）；Chromium 要求 video:true 才允许音频
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { echoCancellation: false, noiseSuppression: false } });
-    if (stream.getAudioTracks().length === 0) {
-      stream.getTracks().forEach((t) => t.stop());
-      throw new Error('未选择共享音频：请勾选「共享标签页音频/系统音频」');
+    if (system) {
+      // 共享标签页/整个屏幕的声音（面试官说话声）；Chromium 要求 video:true 才允许音频
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: { echoCancellation: false, noiseSuppression: false } });
+      if (stream.getAudioTracks().length === 0) {
+        stream.getTracks().forEach((t) => t.stop());
+        throw new Error('未选择共享音频：请勾选「共享标签页音频/系统音频」');
+      }
+      stream.getVideoTracks().forEach((t) => { t.stop(); stream.removeTrack(t); });
+    } else {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
     }
-    stream.getVideoTracks().forEach((t) => { t.stop(); stream.removeTrack(t); });
-  } else {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
+  } catch (e) {
+    // P2：采集失败也要释放 AudioContext / Blob URL / 已拿到的媒体轨
+    try { stream?.getTracks().forEach((t) => t.stop()); } catch { /* ignore */ }
+    try { await ctx.close(); } catch { /* ignore */ }
+    if (moduleUrl) URL.revokeObjectURL(moduleUrl);
+    onError?.(e?.message || String(e));
+    throw e;
   }
+  if (moduleUrl) URL.revokeObjectURL(moduleUrl);
 
   const src = ctx.createMediaStreamSource(stream);
   const node = new AudioWorkletNode(ctx, 'pcm16-sender');
@@ -67,17 +86,21 @@ export async function startVoiceCapture({ socket, speakerId = 'self', system = f
   let stopped = false;
   node.port.onmessage = (e) => {
     if (stopped) return;
+    // P2：断线后不再发送音频帧（服务端已拒绝/重连中）
+    if (socket.connected === false) return;
     const { pcm, level } = e.data;
-    socket.emit('stt.data', { data: bufToB64(pcm), speakerId });
+    socket.emit('stt.data', { data: encodeFrame(pcm), speakerId });
     onLevel?.(level);
   };
 
-  socket.emit('stt.start', { silenceGateMs: 2000 });
+  socket.emit('stt.start', { silenceGateMs: 2000, speakerId });
 
   const stop = () => {
     if (stopped) return;
     stopped = true;
-    try { socket.emit('stt.end', {}); } catch { /* ignore */ }
+    try {
+      if (socket.connected !== false) socket.emit('stt.end', { speakerId });
+    } catch { /* ignore */ }
     try { node.port.onmessage = null; node.disconnect(); src.disconnect(); } catch { /* ignore */ }
     stream.getTracks().forEach((t) => t.stop());
     ctx.close().catch(() => {});

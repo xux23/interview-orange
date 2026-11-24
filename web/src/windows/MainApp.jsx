@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { api, refreshUser, locale } from '../api/client';
+import { api, refreshUser, locale, getSocketToken } from '../api/client';
 import { LOCALES, setLocale as saveLocale } from '../lib/i18n';
 import { overlayWindow, publish } from '../lib/bridge';
 import { isNative, stealthState, setContentProtection, setSkipTaskbar, disguiseTitle, panicToggle } from '../lib/native';
@@ -8,17 +8,55 @@ import { Markdown } from '../lib/markdown.jsx';
 import { startVoiceCapture } from '../lib/voice';
 import { getToken } from '../api/client';
 
-const TABS = [
-  ['home', '工作台'],
-  ['mock', '模拟面试'],
-  ['exam', '笔试助手'],
-  ['live', '真实面试辅助'],
-  ['bank', '题库'],
-  ['material', '资料库'],
-  ['prompt', '提示词工作室'],
-  ['stealth', '隐蔽与防检测'],
-  ['settings', '设置'],
+const NAV = [
+  {
+    label: '练习',
+    items: [
+      ['home', '工作台', 'home'],
+      ['mock', '模拟面试', 'mic'],
+      ['exam', '笔试助手', 'monitor'],
+      ['live', '真实面试辅助', 'live'],
+    ],
+  },
+  {
+    label: '资料',
+    items: [
+      ['bank', '题库', 'layers'],
+      ['material', '资料库', 'folder'],
+      ['prompt', '提示词工作室', 'terminal'],
+    ],
+  },
+  {
+    label: '系统',
+    items: [
+      ['stealth', '隐蔽与防检测', 'shield'],
+      ['settings', '设置', 'sliders'],
+    ],
+  },
 ];
+
+const SESSION_TYPE = { MOCK_INTERVIEW: '模拟面试', INTERVIEW: '真实面试', EXAM: '笔试' };
+
+function NavIcon({ name }) {
+  const common = {
+    width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+    strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true,
+  };
+  const paths = {
+    home: <><path d="M4 10.5 12 4l8 6.5" /><path d="M6 9.5V20h12V9.5" /><path d="M10 20v-5h4v5" /></>,
+    mic: <><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" /><path d="M9 21h6" /></>,
+    monitor: <><rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 21h8" /><path d="M12 17v4" /></>,
+    live: <><path d="M4 14v-2a8 8 0 0 1 16 0v2" /><rect x="3" y="13" width="4.5" height="7" rx="2" /><rect x="16.5" y="13" width="4.5" height="7" rx="2" /><path d="M19 20v1a3 3 0 0 1-3 3h-3" /></>,
+    layers: <><path d="m12 3 9 5-9 5-9-5 9-5Z" /><path d="m3 13 9 5 9-5" /></>,
+    folder: <><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" /></>,
+    terminal: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3" /><path d="M13 15h4" /></>,
+    shield: <><path d="M12 3 5 6v6c0 4.4 2.8 7.4 7 9 4.2-1.6 7-4.6 7-9V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></>,
+    sliders: <><path d="M4 7h10" /><path d="M18 7h2" /><circle cx="16" cy="7" r="2" /><path d="M4 17h2" /><path d="M10 17h10" /><circle cx="8" cy="17" r="2" /></>,
+    sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>,
+    moon: <><path d="M20 14.5A8 8 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5Z" /></>,
+  };
+  return <svg {...common}>{paths[name] || paths.home}</svg>;
+}
 
 const DIFFICULTY = [
   ['FRESH_GRADUATE', '应届'],
@@ -85,7 +123,14 @@ export default function MainApp({ user: initialUser }) {
     let done = false;
     nat.crashRecovery().then(async (st) => {
       if (!st?.isCrashRecovery) return;
+      // 只有确实存在进行中的面试会话才恢复浮窗；否则启动时只弹一个空白预览，体验很差
+      const active = await api.query('session.getActiveSession', { type: 'INTERVIEW' }).catch(() => null);
+      if (!active) {
+        console.info('[crash-recovery] 没有进行中的面试会话，跳过浮窗恢复');
+        return;
+      }
       const seq = await nat.showOverlay({ mode: 'interview' });
+      publish({ type: 'overlay-shown', seq, mode: 'interview', sessionId: active.id });
       const onReady = async (ev) => {
         const d = ev.detail || {};
         if (d.event !== 'overlay-session-ready') return;
@@ -122,59 +167,63 @@ export default function MainApp({ user: initialUser }) {
           </div>
         </div>
         <nav className="nav">
-          {TABS.map(([key, label]) => (
-            <button key={key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}>{label}</button>
+          {NAV.map((group) => (
+            <div className="nav-group" key={group.label}>
+              <div className="nav-label">{group.label}</div>
+              {group.items.map(([key, label, icon]) => (
+                <button key={key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}>
+                  <NavIcon name={icon} />
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
           ))}
         </nav>
         <div className="side-foot">
-          <div>资产：面试 {user.asset.interviewTime} 分钟</div>
-          <div>模拟 {user.asset.mockInterviewCount} 场 · 押题 {user.asset.questionPredictionCount} 次</div>
-          <div className="row" style={{ marginTop: 8 }}>
-            <button className="btn ghost sm" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}>
-              {theme === 'light' ? '切到深色' : '切到浅色'}
+          <div className="side-note">
+            <span className="status-dot" />
+            <div>
+              <b>本地档案</b>
+              <span>无账号 · 数据在 ./data</span>
+            </div>
+            <button
+              className="icon-btn"
+              title={theme === 'light' ? '切到深色' : '切到浅色'}
+              onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+            >
+              <NavIcon name={theme === 'light' ? 'moon' : 'sun'} />
             </button>
-            <button className="btn sm" style={{ marginLeft: 'auto' }} onClick={async () => {
-              try {
-                const order = await api.mutate('pay.createOrder', { id: 'weekly', channel: 'wxpay', from: 'desktop' });
-                window.open(order.checkoutUrl, 'ml-pay', 'popup=1,width=420,height=560');
-                notice(`已创建订单 ${order.orderNumber}`);
-              } catch (e) { notice(e.message); }
-            }}>前往充值</button>
           </div>
         </div>
       </aside>
 
-      <main className="main" style={{ paddingTop: ann ? 64 : 22 }}>
-        {ann && (
-          <div style={{
-            position: 'fixed', top: 0, left: 220, right: 0, zIndex: 40,
-            background: 'var(--accent-soft)', borderBottom: '1px solid var(--line)',
-            padding: '9px 18px', fontSize: 13, display: 'flex', gap: 10, alignItems: 'center',
-          }}>
-            <b>{ann.title}</b>
-            <span className="muted" style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{ann.content}</span>
-            <button className="btn ghost sm" onClick={() => setAnn(null)}>关闭</button>
-          </div>
-        )}
-        {tab === 'home' && <Home user={user} notice={notice} onTab={setTab} />}
-        {tab === 'mock' && <MockSetup user={user} notice={notice} reloadUser={reloadUser} />}
-        {tab === 'exam' && <ExamSetup user={user} notice={notice} reloadUser={reloadUser} />}
-        {tab === 'live' && <LiveAssist user={user} notice={notice} />}
-        {tab === 'bank' && <BankPage notice={notice} />}
-        {tab === 'material' && <MaterialPage notice={notice} />}
-        {tab === 'prompt' && <PromptPage notice={notice} />}
-        {tab === 'stealth' && <StealthPage notice={notice} />}
-        {tab === 'settings' && <SettingsPage user={user} notice={notice} reloadUser={reloadUser} />}
+      <main className="main">
+        <div className="main-inner">
+          {ann && (
+            <div className="notice-bar">
+              <span className="notice-tag">公告</span>
+              <b>{ann.title}</b>
+              <span className="notice-text">{ann.content}</span>
+              <button className="icon-btn" aria-label="关闭公告" onClick={() => setAnn(null)}>×</button>
+            </div>
+          )}
+          {tab === 'home' && <Home user={user} notice={notice} onTab={setTab} />}
+          {tab === 'mock' && <MockSetup user={user} notice={notice} reloadUser={reloadUser} />}
+          {tab === 'exam' && <ExamSetup user={user} notice={notice} reloadUser={reloadUser} />}
+          {tab === 'live' && <LiveAssist user={user} notice={notice} />}
+          {tab === 'bank' && <BankPage notice={notice} />}
+          {tab === 'material' && <MaterialPage notice={notice} />}
+          {tab === 'prompt' && <PromptPage notice={notice} />}
+          {tab === 'stealth' && <StealthPage notice={notice} />}
+          {tab === 'settings' && <SettingsPage user={user} notice={notice} reloadUser={reloadUser} />}
+        </div>
       </main>
 
       {pendingNotice && (
-        <div style={{
-          position: 'fixed', inset: 0, background: 'rgba(15,17,21,.45)', zIndex: 80,
-          display: 'grid', placeItems: 'center',
-        }}>
-          <div className="card pad" style={{ width: 460, maxWidth: '92vw' }}>
-            <b>使用须知</b>
-            <p className="muted" style={{ lineHeight: 1.7 }}>
+        <div className="modal-backdrop">
+          <div className="modal-card">
+            <div className="modal-head"><b>使用须知</b><span className="chip">首次使用</span></div>
+            <p>
               {pendingNotice.payload?.text || '本工具用于模拟面试与笔试练习。请在合规场景下使用：国家考试、公务员录用、事业单位招聘、军队文职、职业资格考试等环节禁止使用。'}
             </p>
             <div className="row">
@@ -188,12 +237,7 @@ export default function MainApp({ user: initialUser }) {
         </div>
       )}
 
-      {toast && (
-        <div style={{
-          position: 'fixed', bottom: 22, left: '50%', transform: 'translateX(-50%)',
-          background: '#111827', color: '#fff', padding: '9px 16px', borderRadius: 10, fontSize: 13, zIndex: 99,
-        }}>{toast}</div>
-      )}
+      {toast && <div className="toast">{toast}</div>}
     </div>
   );
 }
@@ -202,61 +246,93 @@ export default function MainApp({ user: initialUser }) {
 function Home({ user, notice, onTab }) {
   const [sessions, setSessions] = useState([]);
   const [report, setReport] = useState(null);
+  const reportIdRef = useRef(null);
 
   useEffect(() => {
     api.query('session.getSessions', { page: 1, pageSize: 8 }).then((r) => setSessions(r.items)).catch(() => {});
   }, []);
 
   const openReport = async (id) => {
+    reportIdRef.current = id;
     try {
       const r = await api.query('session.getSessionReport', { id });
       setReport(r);
     } catch (e) { notice(e.message); }
   };
 
+  // P1-6：报告未就绪时真正轮询（带清理），不再只写「约 3 秒后自动刷新」的假文案
+  useEffect(() => {
+    if (!report || report.status === 'success' || report.status === 'READY') return undefined;
+    if (!reportIdRef.current) return undefined;
+    let cancelled = false;
+    let timer = null;
+    let tries = 0;
+    const tick = async () => {
+      if (cancelled) return;
+      tries += 1;
+      try {
+        const r = await api.query('session.getSessionReport', { id: reportIdRef.current });
+        if (cancelled) return;
+        setReport(r);
+        if (r?.status === 'success' || r?.status === 'READY' || tries >= 10) return;
+      } catch { /* 继续重试 */ }
+      if (!cancelled) timer = setTimeout(tick, 2500);
+    };
+    timer = setTimeout(tick, 2500);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [report?.status, report?.title]);
+
   return (
     <>
-      <div className="page-title"><h1>工作台</h1><span className="chip">{user.asset.isPro ? 'PRO' : '体验版'}</span></div>
-      <div className="hero">
-        <h2>AI 面试 / 笔试辅助</h2>
-        <p style={{ margin: 0, opacity: .9 }}>
-          模拟面试官按简历与岗位出题，实时给出「核心要点 + 参考回答」；笔试截图解题，答案直接投到浮窗。
-        </p>
-        <div className="row">
-          <button className="btn" onClick={() => onTab('mock')}>开始模拟面试</button>
+      <div className="page-title"><h1>工作台</h1><span className="chip">本地版</span></div>
+      <p className="page-sub">今天的练习、报告与快捷入口。</p>
+      <section className="hero">
+        <h2>开口之前，答案已经在屏幕上。</h2>
+        <p>模拟面试官按简历与岗位出题，实时给出「核心要点 + 参考回答」；笔试截图解题，答案直接投到浮窗。</p>
+        <div className="row hero-actions">
+          <button className="btn primary" onClick={() => onTab('mock')}>开始模拟面试</button>
           <button className="btn" onClick={() => onTab('exam')}>笔试助手</button>
           <button className="btn" onClick={() => onTab('live')}>真实面试浮窗</button>
         </div>
-      </div>
-
-      <div className="grid3" style={{ marginTop: 16 }}>
-        <div className="card stat"><div className="muted tiny">面试额度（分钟）</div><b>{user.asset.interviewTime}</b></div>
-        <div className="card stat"><div className="muted tiny">模拟面试剩余场次</div><b>{user.asset.mockInterviewCount}</b></div>
-        <div className="card stat"><div className="muted tiny">押题次数</div><b>{user.asset.questionPredictionCount}</b></div>
-      </div>
+      </section>
 
       <div className="card" style={{ marginTop: 16 }}>
-        <div className="row" style={{ padding: '12px 14px' }}>
-          <b>最近会话</b><span className="spacer" />
+        <div className="section-head">
+          <b>最近会话</b><span className="count">{sessions.length}</span>
+          <span className="spacer" />
           <button className="btn ghost sm" onClick={() => location.reload()}>刷新</button>
         </div>
-        <div className="divider" style={{ margin: 0 }} />
-        {sessions.length === 0 && <div style={{ padding: 18 }} className="muted">还没有会话，从「模拟面试」开始。</div>}
-        {sessions.map((s) => (
-          <div className="list-item" key={s.id}>
-            <span className={`pill ${s.status === 'ACTIVE' ? '' : 'gray'}`}>{s.status === 'ACTIVE' ? '进行中' : '已完成'}</span>
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontWeight: 600 }}>{s.metadata?.title || s.type}</div>
-              <small>{new Date(s.createdAt).toLocaleString()} · {s.type} · 时长 {s.realDuration ?? 0}s</small>
-            </div>
-            <span className="spacer" />
-
-            {s.status === 'COMPLETED' && <button className="btn sm" onClick={() => openReport(s.id)}>查看报告</button>}
-            {s.status === 'ACTIVE' && (
-              <button className="btn sm" onClick={() => window.open(`#mock?session=${s.id}`, 'ml-mock-room', 'width=980,height=760')}>进入房间</button>
-            )}
+        {sessions.length === 0 && (
+          <div className="empty-state">
+            <b>还没有会话</b>
+            <span>从「模拟面试」开始，报告会保存在本地。</span>
           </div>
-        ))}
+        )}
+        {sessions.map((s) => {
+          const live = s.status === 'ACTIVE';
+          return (
+            <div className="session-row" key={s.id}>
+              <div className={`session-state ${live ? 'live' : 'done'}`}>
+                <span className="status-dot" />{live ? '进行中' : '已完成'}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div className="session-title">{s.metadata?.title || SESSION_TYPE[s.type] || s.type}</div>
+                <div className="session-meta">
+                  <span>{new Date(s.createdAt).toLocaleString()}</span>
+                  <span className="sep">/</span>
+                  <span>{SESSION_TYPE[s.type] || s.type}</span>
+                  <span className="sep">/</span>
+                  <span>{s.realDuration ?? 0}s</span>
+                </div>
+              </div>
+              <div className="session-action">
+                {live
+                  ? <button className="btn sm" onClick={() => window.open(`#mock?session=${s.id}`, 'ml-mock-room', 'width=980,height=760')}>进入房间</button>
+                  : <button className="btn sm" onClick={() => openReport(s.id)}>查看报告</button>}
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       {report && (
@@ -270,13 +346,23 @@ function Home({ user, notice, onTab }) {
           </div>
 
           {report.status !== 'success' && report.status !== 'READY' && (
-            <p className="muted">报告{report.status === 'pending' ? '生成中，约 3 秒后自动刷新…' : report.status}</p>
+            <p className="muted">报告{report.status === 'pending' ? '生成中，正在自动刷新…' : report.status}</p>
           )}
 
-          {report.interviewSummary && (
-            <>
+          {(() => {
+            // 高危5：模型返回缺字段时不整页崩掉——数组逐个 Array.isArray 防护
+            const summary = (report.interviewSummary && typeof report.interviewSummary === 'object') ? report.interviewSummary : null;
+            if (!summary) return null;
+            const dims = Array.isArray(summary.fiveDimensions) ? summary.fiveDimensions : [];
+            const strengths = Array.isArray(summary.strengths) ? summary.strengths : [];
+            const shortcomings = Array.isArray(summary.shortcomings) ? summary.shortcomings : [];
+            const suggestions = Array.isArray(summary.interviewSuggestions) ? summary.interviewSuggestions : [];
+            const emptyHint = <div className="muted tiny">未生成该部分</div>;
+            return (
+              <>
               <div className="grid3" style={{ marginTop: 10 }}>
-                {report.interviewSummary.fiveDimensions.map((d) => (
+                {dims.length === 0 && <div className="card pad" style={{ boxShadow: 'none', background: 'var(--panel-2)' }}>{emptyHint}</div>}
+                {dims.map((d) => (
                   <div key={d.dimension} className="card pad" style={{ boxShadow: 'none', background: 'var(--panel-2)' }}>
                     <small>{d.dimension}</small>
                     <div><b>{d.score}</b>/100</div>
@@ -286,14 +372,15 @@ function Home({ user, notice, onTab }) {
                   </div>
                 ))}
               </div>
-              <p style={{ marginTop: 12 }}>{report.interviewSummary.interviewSummary}</p>
+              <p style={{ marginTop: 12 }}>{summary.interviewSummary}</p>
               <div className="grid2">
-                <div><b>优点</b><ul>{report.interviewSummary.strengths.map((s, i) => <li key={i}><b>{s.strength}</b>：{s.reason}</li>)}</ul></div>
-                <div><b>短板</b><ul>{report.interviewSummary.shortcomings.map((s, i) => <li key={i}><b>{s.shortcoming}</b>：{s.reason}</li>)}</ul></div>
+                <div><b>优点</b>{strengths.length === 0 ? emptyHint : <ul>{strengths.map((s, i) => <li key={i}><b>{s.strength}</b>：{s.reason}</li>)}</ul>}</div>
+                <div><b>短板</b>{shortcomings.length === 0 ? emptyHint : <ul>{shortcomings.map((s, i) => <li key={i}><b>{s.shortcoming}</b>：{s.reason}</li>)}</ul>}</div>
               </div>
-              <div><b>改进建议</b><ol>{report.interviewSummary.interviewSuggestions.map((s, i) => <li key={i}>{s}</li>)}</ol></div>
-            </>
-          )}
+              <div><b>改进建议</b>{suggestions.length === 0 ? emptyHint : <ol>{suggestions.map((s, i) => <li key={i}>{s}</li>)}</ol>}</div>
+              </>
+            );
+          })()}
 
           {Array.isArray(report.conversationAnalysis) && report.conversationAnalysis.length > 0 && (
             <div style={{ marginTop: 12 }}>
@@ -395,7 +482,7 @@ function MockSetup({ user, notice, reloadUser }) {
         goalId: form.goalId,
         audioSource: 'MICROPHONE',
         round: form.round,
-        isTrial: !user.asset.isPro,
+        isTrial: false,
         metadata: {
           assistMode: form.assistMode, difficulty: form.difficulty, lang: locale(),
           turnBudget: form.turnBudget, basicsRatio: 0.4, answerStyle: form.answerStyle,
@@ -576,7 +663,7 @@ function LiveAssist({ user, notice }) {
       const active = await api.query('session.getActiveSession', { type: 'INTERVIEW' }).catch(() => null);
       const s = active || await api.mutate('session.createSession', {
         type: 'INTERVIEW', resumeId: form.resumeId, goalId: form.goalId,
-        audioSource: form.audioSource, round: 'FIRST', isTrial: !user.asset.isPro,
+        audioSource: form.audioSource, round: 'FIRST', isTrial: false,
         metadata: { assistMode: true, answerStyle: form.answerStyle, lang: locale() },
       });
       setSession(s);
@@ -610,7 +697,7 @@ function LiveAssist({ user, notice }) {
     if (!session) { setCapErr('先开启浮窗建立会话，再采集音频'); return; }
     try {
       if (!socketRef.current) {
-        socketRef.current = io('/', { auth: { token: getToken(), locale: locale(), sessionId: session.id }, transports: ['websocket'] });
+        socketRef.current = io('/', { auth: { token: getToken(), socketToken: getSocketToken(), locale: locale(), sessionId: session.id }, transports: ['websocket'] });
       }
       const stopFn = await startVoiceCapture({
         socket: socketRef.current,
@@ -1009,6 +1096,8 @@ function StealthPage({ notice }) {
 
   const load = () => stealthState().then(setState).catch(() => setState({ browser: true }));
   useEffect(() => { load(); }, []); // eslint-disable-line
+  // P2：离开隐蔽页时停止 WASAPI 采集，避免系统音频长期运行
+  useEffect(() => () => { try { window.orangeNative?.audioStop?.(); } catch { /* ignore */ } }, []);
 
   // 原生事件：音频电平 / 焦点变化
   useEffect(() => {
@@ -1143,18 +1232,177 @@ function StealthPage({ notice }) {
 function SettingsPage({ user, notice, reloadUser }) {
   const [lang, setLang] = useState(locale());
   const [style, setStyle] = useState(user.clientSettings?.overlayStyle || {});
-  const [panic, setPanic] = useState(user.clientSettings?.panicHotkey || 'Esc+Esc');
+  // P1-4：默认与实际注册的 panic 热键一致（原生壳默认 Ctrl+Alt+Esc）
+  const [panic, setPanic] = useState(user.clientSettings?.panicHotkey || 'Ctrl+Alt+Esc');
   const [busy, setBusy] = useState(false);
   const [env, setEnv] = useState(null);
   useEffect(() => { fetch('/healthz').then((r) => r.json()).then(setEnv).catch(() => {}); }, []);
+
+  /* ── AI 接入运行时配置（settings.ai.*）：写 DB + 热切换，不需要重启 ── */
+  const [aiInfo, setAiInfo] = useState(null);
+  const [aiForm, setAiForm] = useState(null);
+  const [aiProbe, setAiProbe] = useState(null);
+  const [aiBusy, setAiBusy] = useState(false);
+
+  const fillAI = (r) => {
+    setAiInfo(r);
+    setAiForm({
+      provider: r.provider, baseUrl: r.baseUrl, model: r.model,
+      visionModel: r.visionModel, temperature: r.temperature, apiKey: '',
+    });
+  };
+  const refreshHealth = () => fetch('/healthz').then((r) => r.json()).then(setEnv).catch(() => {});
+
+  useEffect(() => {
+    api.query('settings.ai.get').then(fillAI).catch((e) => notice(`读取 AI 配置失败：${e.message}`));
+  }, []);
+
+  const aiPayload = () => {
+    const p = {
+      provider: aiForm.provider,
+      baseUrl: aiForm.baseUrl,
+      model: aiForm.model,
+      visionModel: aiForm.visionModel,
+      temperature: Number(aiForm.temperature),
+    };
+    if (String(aiForm.apiKey || '').trim()) p.apiKey = aiForm.apiKey.trim();
+    return p;
+  };
+
+  const aiSave = async () => {
+    setAiBusy(true);
+    try {
+      const r = await api.mutate('settings.ai.set', aiPayload());
+      fillAI(r);
+      refreshHealth();
+      notice(`AI 配置已保存并热切换：provider=${r.provider}${r.hasKey ? '（Key 已保存）' : '（未配置 Key）'}`);
+    } catch (e) { notice(e.message); } finally { setAiBusy(false); }
+  };
+
+  const aiTest = async () => {
+    setAiBusy(true);
+    setAiProbe(null);
+    try {
+      const r = await api.mutate('settings.ai.probe', aiPayload());
+      setAiProbe(r);
+      const bad = (r.checks || []).find((c) => !c.ok);
+      notice(r.ok ? `连通性自检通过（${r.latencyMs}ms）` : `自检未通过：${r.error || bad?.detail || '未知原因'}`);
+    } catch (e) {
+      setAiProbe({ ok: false, checks: [{ name: 'request', ok: false, detail: e.message }] });
+      notice(e.message);
+    } finally { setAiBusy(false); }
+  };
+
+  const aiReset = async () => {
+    setAiBusy(true);
+    try {
+      const r = await api.mutate('settings.ai.reset', {});
+      fillAI(r);
+      refreshHealth();
+      notice('已回退到 .env / 出厂默认配置');
+    } catch (e) { notice(e.message); } finally { setAiBusy(false); }
+  };
+
+  const aiClearKey = async () => {
+    setAiBusy(true);
+    try {
+      const r = await api.mutate('settings.ai.set', { clearApiKey: true, provider: 'mock' });
+      fillAI(r);
+      refreshHealth();
+      notice('API Key 已清除，provider 回落 mock');
+    } catch (e) { notice(e.message); } finally { setAiBusy(false); }
+  };
+
+  /* ── ASR 语音识别运行时配置（settings.asr.*）：同一套覆盖机制，独立 section ── */
+  const [asrInfo, setAsrInfo] = useState(null);
+  const [asrForm, setAsrForm] = useState(null);
+  const [asrProbe, setAsrProbe] = useState(null);
+  const [asrBusy, setAsrBusy] = useState(false);
+
+  const fillASR = (r) => {
+    setAsrInfo(r);
+    setAsrForm({
+      provider: r.provider, baseUrl: r.baseUrl, model: r.model,
+      silenceGateMs: r.silenceGateMs, maxUtteranceMs: r.maxUtteranceMs, apiKey: '',
+    });
+  };
+
+  useEffect(() => {
+    api.query('settings.asr.get').then(fillASR).catch((e) => notice(`读取 ASR 配置失败：${e.message}`));
+  }, []);
+
+  const asrPayload = () => {
+    const p = {
+      provider: asrForm.provider,
+      baseUrl: asrForm.baseUrl,
+      model: asrForm.model,
+      silenceGateMs: Number(asrForm.silenceGateMs),
+      maxUtteranceMs: Number(asrForm.maxUtteranceMs),
+    };
+    if (String(asrForm.apiKey || '').trim()) p.apiKey = asrForm.apiKey.trim();
+    return p;
+  };
+
+  const asrSave = async () => {
+    setAsrBusy(true);
+    try {
+      const r = await api.mutate('settings.asr.set', asrPayload());
+      fillASR(r);
+      refreshHealth();
+      notice(`语音识别已保存并热切换：provider=${r.provider} · ${r.task === 'real' ? '真实转写' : '本地替身'}`);
+    } catch (e) { notice(e.message); } finally { setAsrBusy(false); }
+  };
+
+  const asrTest = async () => {
+    setAsrBusy(true);
+    setAsrProbe(null);
+    try {
+      const r = await api.mutate('settings.asr.probe', asrPayload());
+      setAsrProbe(r);
+      const bad = (r.checks || []).find((c) => !c.ok);
+      notice(r.ok ? `ASR 自检通过（${r.latencyMs}ms）` : `ASR 自检未通过：${r.error || bad?.detail || '未知原因'}`);
+    } catch (e) {
+      setAsrProbe({ ok: false, checks: [{ name: 'request', ok: false, detail: e.message }] });
+      notice(e.message);
+    } finally { setAsrBusy(false); }
+  };
+
+  const asrReset = async () => {
+    setAsrBusy(true);
+    try {
+      const r = await api.mutate('settings.asr.reset', {});
+      fillASR(r);
+      refreshHealth();
+      notice('语音识别已回退到 .env / 出厂默认配置');
+    } catch (e) { notice(e.message); } finally { setAsrBusy(false); }
+  };
+
+  const asrClearKey = async () => {
+    setAsrBusy(true);
+    try {
+      const r = await api.mutate('settings.asr.set', { clearApiKey: true, provider: 'mock' });
+      fillASR(r);
+      refreshHealth();
+      notice('ASR Key 已清除，语音识别回落本地替身');
+    } catch (e) { notice(e.message); } finally { setAsrBusy(false); }
+  };
 
   const save = async () => {
     setBusy(true);
     try {
       await api.mutate('user.updateClientSettings', { overlayStyle: style, panicHotkey: panic, locale: lang });
       saveLocale(lang);
+      // P1-4：保存后把 panic 热键热注册进原生壳（不重启即生效），并回显实际注册结果
+      try {
+        const r = await window.orangeNative?.hotkeys?.([{ accel: panic, action: 'panic' }]);
+        const items = r?.registered || [];
+        notice(items.length > 0
+          ? `设置已保存；panic 热键已注册：${items.map((i) => i.accel).join('、')}`
+          : `设置已保存；panic 热键未注册（无修饰键组合如 Esc+Esc 只能在浮窗内双击 Esc 触发）`);
+      } catch (e) {
+        notice(`设置已保存（客户端 1s 防抖提交）；热键注册失败：${e.message}`);
+      }
       await reloadUser();
-      notice('设置已保存（客户端 1s 防抖提交）');
     } catch (e) { notice(e.message); } finally { setBusy(false); }
   };
 
@@ -1165,14 +1413,18 @@ function SettingsPage({ user, notice, reloadUser }) {
       clientSettings: user.clientSettings,
       examCustomization: user.examCustomization,
       interviewPreference: user.interviewPreference,
-      local: Object.fromEntries(Object.keys(localStorage).filter((k) => k !== 'token').map((k) => [k, localStorage.getItem(k)])),
+      // P2：过滤所有 token / token_<region>，避免把凭证写进导出文件
+      local: Object.fromEntries(Object.keys(localStorage)
+        .filter((k) => !/^token(_|$)/.test(k))
+        .map((k) => [k, localStorage.getItem(k)])),
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
+    const href = URL.createObjectURL(blob);
+    a.href = href;
     a.download = 'interview-orange-config.json';
     a.click();
-    URL.revokeObjectURL(a.href);
+    setTimeout(() => URL.revokeObjectURL(href), 2000); // P2：过早 revoke 会让部分环境下载失败
   };
 
   const importCfg = async (file) => {
@@ -1181,6 +1433,13 @@ function SettingsPage({ user, notice, reloadUser }) {
       if (cfg.clientSettings) await api.mutate('user.updateClientSettings', cfg.clientSettings);
       if (cfg.examCustomization) await api.mutate('user.updateExamCustomization', cfg.examCustomization);
       if (cfg.interviewPreference) await api.mutate('user.updateInterviewPreference', cfg.interviewPreference);
+      // P2：local 段真正回写（过滤 token 类键）
+      if (cfg.local && typeof cfg.local === 'object') {
+        for (const [k, v] of Object.entries(cfg.local)) {
+          if (/^token(_|$)/.test(k) || typeof v !== 'string') continue;
+          localStorage.setItem(k, v);
+        }
+      }
       await reloadUser();
       notice('配置已导入（逐字段校验通过）');
     } catch (e) { notice(`导入失败：${e.message}`); }
@@ -1229,7 +1488,8 @@ function SettingsPage({ user, notice, reloadUser }) {
               <input type="number" value={style.examHeight ?? 520} onChange={(e) => setStyle({ ...style, examHeight: Number(e.target.value) })} /></div>
           </div>
           <div className="field"><label>紧急隐藏热键（panic）</label>
-            <input type="text" value={panic} onChange={(e) => setPanic(e.target.value)} placeholder="Esc+Esc" />
+            <input type="text" value={panic} onChange={(e) => setPanic(e.target.value)} placeholder="Ctrl+Alt+Esc" />
+            <small className="muted">需含 Ctrl/Alt/Shift/Win 至少一个修饰键才会全局注册（如 Ctrl+Alt+P）；无修饰键组合（如 Esc+Esc）不会注册，仅浮窗内双击 Esc 生效。</small>
           </div>
           <div className="row">
             <button className="btn primary" disabled={busy} onClick={save}>保存</button>
@@ -1244,15 +1504,14 @@ function SettingsPage({ user, notice, reloadUser }) {
             <button className="btn" onClick={exportCfg}>导出配置</button>
             <label className="btn" style={{ cursor: 'pointer' }}>
               导入配置
-              <input type="file" accept="application/json" hidden onChange={(e) => e.target.files[0] && importCfg(e.target.files[0])} />
+              <input type="file" accept="application/json" hidden onChange={(e) => { const f = e.target.files[0]; if (f) importCfg(f).finally(() => { e.target.value = ''; }); }} />
             </label>
           </div>
           <div className="divider" />
-          <b>账号</b>
+          <b>本地档案</b>
           <div className="tiny muted">
-            <div>手机：{user.phone}</div>
-            <div>用户：<span className="mono">{user.id}</span></div>
-            <div>订阅：{user.asset.subLevel}{user.asset.isPro ? '（有效）' : '（体验）'} · 面试额度 {user.asset.interviewTime} 分钟</div>
+            <div>档案：<span className="mono">{user.id}</span></div>
+            <div>账号模块已移除：本地单用户，无需登录/订阅</div>
           </div>
           <div className="divider" />
           <b>本地环境</b>
@@ -1260,11 +1519,11 @@ function SettingsPage({ user, notice, reloadUser }) {
             <div>
               AI 引擎：{env
                 ? (env.provider === 'mock'
-                  ? '本地 mock 大脑（离线；.env 配 ML_AI_API_KEY 可切真模型）'
-                  : `真实模型 ${env.model || ''}`.trim())
+                  ? '本地 mock 大脑（离线；在下方 AI 接入填 Key 可切真模型）'
+                  : `真实模型 ${env.model || ''}（来源 ${env.providerSource === 'settings' ? '设置页' : '.env'}）`.trim())
                 : '读取中…'}
             </div>
-            <div>语音识别：{env ? (env.asr === 'mock' ? '本地替身（未配 ASR key）' : env.asr) : '读取中…'}</div>
+            <div>语音识别：{env ? (env.asr === 'mock' ? '本地替身（未配 ASR key，可在下方卡片切换）' : `${env.asr}${env.asrSource === 'settings' ? '（设置页覆盖）' : ''}`) : '读取中…'}</div>
             <div>服务：http://127.0.0.1:8756（{env?.version || ''}）</div>
             <div>数据目录：./data/app.db（SQLite 单文件，整目录可搬迁）</div>
           </div>
@@ -1272,6 +1531,157 @@ function SettingsPage({ user, notice, reloadUser }) {
           <b>提示词缓存</b>
           <button className="btn sm" onClick={() => { localStorage.removeItem('prompts.cache'); notice('已清空本地提示词缓存'); }}>清空</button>
         </div>
+      </div>
+
+      <div className="card pad col" style={{ marginTop: 14 }}>
+        <b>AI 接入（运行时配置中心）</b>
+        <small className="muted">
+          写入 data/app.db 并立即热切换（无需重启服务）；API Key 留空表示「保留原值」，服务端只回掩码。
+          当前来源：{aiInfo ? (aiInfo.source === 'settings' ? `设置页覆盖（${aiInfo.savedKeys.length} 个字段）` : '.env / 出厂默认') : '读取中…'}
+          {aiInfo?.updatedAt ? ` · 更新于 ${new Date(aiInfo.updatedAt).toLocaleString()}` : ''}
+        </small>
+        {aiForm ? (
+          <>
+            <div className="row" style={{ alignItems: 'flex-end' }}>
+              <div className="field" style={{ flex: 2 }}>
+                <label>provider</label>
+                <select value={aiForm.provider} onChange={(e) => setAiForm({ ...aiForm, provider: e.target.value })}>
+                  <option value="mock">mock（离线确定性大脑，零外网）</option>
+                  <option value="openai">openai（任意 OpenAI 兼容网关）</option>
+                </select>
+              </div>
+              <div className="field" style={{ flex: 1 }}>
+                <label>temperature</label>
+                <input type="number" min="0" max="2" step="0.05" value={aiForm.temperature}
+                  onChange={(e) => setAiForm({ ...aiForm, temperature: e.target.value })} />
+              </div>
+            </div>
+            <div className="field">
+              <label>Base URL（含 /v1，末尾斜杠自动去掉）</label>
+              <input value={aiForm.baseUrl} placeholder="https://api.openai.com/v1"
+                onChange={(e) => setAiForm({ ...aiForm, baseUrl: e.target.value })} />
+            </div>
+            <div className="field">
+              <label>API Key {aiInfo?.hasKey ? `（已保存 ${aiInfo.apiKeyMasked}，留空不修改）` : '（未配置）'}</label>
+              <input type="password" autoComplete="off" value={aiForm.apiKey}
+                placeholder={aiInfo?.hasKey ? '留空保留原 Key' : 'sk-...'}
+                onChange={(e) => setAiForm({ ...aiForm, apiKey: e.target.value })} />
+            </div>
+            <div className="grid2">
+              <div className="field">
+                <label>文本模型（面试/笔试答题）</label>
+                <input value={aiForm.model} placeholder="deepseek-v4.1-flash"
+                  onChange={(e) => setAiForm({ ...aiForm, model: e.target.value })} />
+              </div>
+              <div className="field">
+                <label>视觉模型（笔试截图题面）</label>
+                <input value={aiForm.visionModel} placeholder="qwen3.5-omni-flash"
+                  onChange={(e) => setAiForm({ ...aiForm, visionModel: e.target.value })} />
+              </div>
+            </div>
+            <div className="row">
+              <button className="btn primary" disabled={aiBusy} onClick={aiSave}>保存并热切换</button>
+              <button className="btn" disabled={aiBusy} onClick={aiTest}>连通性自检</button>
+              <button className="btn" disabled={aiBusy} onClick={aiReset}>回退 .env</button>
+              {aiInfo?.hasKey && <button className="btn sm" disabled={aiBusy} onClick={aiClearKey}>清除 Key</button>}
+            </div>
+            {aiProbe && (
+              <div className="tiny" style={{ marginTop: 10 }}>
+                <div>
+                  <b>{aiProbe.ok ? '✅ 自检通过' : '❌ 自检未通过'}</b>
+                  {` · ${aiProbe.provider || ''}`}
+                  {typeof aiProbe.latencyMs === 'number' ? ` · ${aiProbe.latencyMs}ms` : ''}
+                  {aiProbe.model ? ` · ${aiProbe.model}` : ''}
+                </div>
+                {(aiProbe.checks || []).map((c) => (
+                  <div key={c.name} className="mono" style={{ color: c.ok ? undefined : '#dc2626', opacity: c.ok ? 0.8 : 1 }}>
+                    {c.ok ? '✓' : '✗'} {c.name}: {c.detail}
+                  </div>
+                ))}
+                {aiProbe.reply && <div>回包：<span className="mono">{aiProbe.reply}</span></div>}
+                {aiProbe.models?.length > 0 && (
+                  <div className="muted">目录预览：{aiProbe.models.slice(0, 6).join(', ')}{aiProbe.models.length > 6 ? ' …' : ''}</div>
+                )}
+              </div>
+            )}
+            <small className="muted" style={{ marginTop: 8 }}>
+              自检真发一次 1-token 补全（验 Key 权限 + 模型名有效性），不落库、不改当前生效配置。
+            </small>
+          </>
+        ) : <small className="muted">读取中…</small>}
+      </div>
+
+      <div className="card pad col" style={{ marginTop: 14 }}>
+        <b>语音识别（运行时配置中心）</b>
+        <small className="muted">
+          与 AI 接入同一套覆盖机制，独立 section（app_settings.key = asr）；保存后新的语音连接即按新配置切句/转写。
+          当前：{asrInfo ? `${asrInfo.task === 'real' ? '真实转写' : '本地替身'} · ${asrInfo.source === 'settings' ? `设置页覆盖（${asrInfo.savedKeys.length} 个字段）` : '.env / 出厂默认'}` : '读取中…'}
+          {asrInfo?.updatedAt ? ` · 更新于 ${new Date(asrInfo.updatedAt).toLocaleString()}` : ''}
+        </small>
+        {asrForm ? (
+          <>
+            <div className="row" style={{ alignItems: 'flex-end' }}>
+              <div className="field" style={{ flex: 2 }}>
+                <label>provider</label>
+                <select value={asrForm.provider} onChange={(e) => setAsrForm({ ...asrForm, provider: e.target.value })}>
+                  <option value="mock">mock（本地替身，零外网）</option>
+                  <option value="qianwen">qianwen（chat/completions + input_audio）</option>
+                </select>
+              </div>
+              <div className="field" style={{ flex: 1 }}>
+                <label>静音收句门限（ms）</label>
+                <input type="number" min="200" max="6000" step="100" value={asrForm.silenceGateMs}
+                  onChange={(e) => setAsrForm({ ...asrForm, silenceGateMs: e.target.value })} />
+              </div>
+              <div className="field" style={{ flex: 1 }}>
+                <label>单句最长（ms）</label>
+                <input type="number" min="1000" max="120000" step="1000" value={asrForm.maxUtteranceMs}
+                  onChange={(e) => setAsrForm({ ...asrForm, maxUtteranceMs: e.target.value })} />
+              </div>
+            </div>
+            <div className="field">
+              <label>Base URL（含 /v1）</label>
+              <input value={asrForm.baseUrl} placeholder="https://maas.qianwenaiapi.com/compatible-mode/v1"
+                onChange={(e) => setAsrForm({ ...asrForm, baseUrl: e.target.value })} />
+            </div>
+            <div className="field">
+              <label>API Key {asrInfo?.hasKey ? `（已保存 ${asrInfo.apiKeyMasked}，留空不修改）` : '（未配置）'}</label>
+              <input type="password" autoComplete="off" value={asrForm.apiKey}
+                placeholder={asrInfo?.hasKey ? '留空保留原 Key' : 'sk-...'}
+                onChange={(e) => setAsrForm({ ...asrForm, apiKey: e.target.value })} />
+            </div>
+            <div className="field">
+              <label>转写模型</label>
+              <input value={asrForm.model} placeholder="qwen3.5-omni-flash"
+                onChange={(e) => setAsrForm({ ...asrForm, model: e.target.value })} />
+            </div>
+            <div className="row">
+              <button className="btn primary" disabled={asrBusy} onClick={asrSave}>保存并热切换</button>
+              <button className="btn" disabled={asrBusy} onClick={asrTest}>连通性自检</button>
+              <button className="btn" disabled={asrBusy} onClick={asrReset}>回退 .env</button>
+              {asrInfo?.hasKey && <button className="btn sm" disabled={asrBusy} onClick={asrClearKey}>清除 Key</button>}
+            </div>
+            {asrProbe && (
+              <div className="tiny" style={{ marginTop: 10 }}>
+                <div>
+                  <b>{asrProbe.ok ? '✅ 自检通过' : '❌ 自检未通过'}</b>
+                  {` · ${asrProbe.provider || ''}`}
+                  {typeof asrProbe.latencyMs === 'number' ? ` · ${asrProbe.latencyMs}ms` : ''}
+                  {asrProbe.model ? ` · ${asrProbe.model}` : ''}
+                </div>
+                {(asrProbe.checks || []).map((c) => (
+                  <div key={c.name} className="mono" style={{ color: c.ok ? undefined : '#dc2626', opacity: c.ok ? 0.8 : 1 }}>
+                    {c.ok ? '✓' : '✗'} {c.name}: {c.detail}
+                  </div>
+                ))}
+                {asrProbe.text ? <div>回包：<span className="mono">{asrProbe.text}</span></div> : null}
+              </div>
+            )}
+            <small className="muted" style={{ marginTop: 8 }}>
+              自检真发一段 0.4s 静音 WAV 走 input_audio 通道（验 Key 权限 + 网关是否支持音频块 + 模型名），不落库、不改生效配置。
+            </small>
+          </>
+        ) : <small className="muted">读取中…</small>}
       </div>
     </>
   );

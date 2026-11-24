@@ -1,4 +1,4 @@
-# 面试橙 · 便携启动器（双击 启动.bat 即可，无需安装任何东西）
+﻿# 面试橙 · 便携启动器（双击 启动.bat 即可，无需安装任何东西）
 # 桌面端 = Rust 原生壳（tao + wry，对齐原版技术栈）：
 #   WDA 防截屏 / Ctrl+Alt+Esc panic / 窗口+进程伪装 / WASAPI 系统音频 / 焦点钩子 / 46 特性开关
 # 用法：
@@ -14,7 +14,16 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
-$port = if ($env:ML_PORT) { $env:ML_PORT } else { 8756 }
+$port = if ($env:ML_PORT) { $env:ML_PORT } else {
+  # P2：与 server/config.js、native/run.ps1 口径一致——读 .env 的 ML_PORT
+  $envFile = Join-Path $PSScriptRoot '.env'
+  $fromEnvFile = $null
+  if (Test-Path $envFile) {
+    $m = Select-String -Path $envFile -Pattern '^\s*ML_PORT\s*=\s*(\d+)' | Select-Object -First 1
+    if ($m) { $fromEnvFile = $m.Matches[0].Groups[1].Value }
+  }
+  if ($fromEnvFile) { $fromEnvFile } else { 8756 }
+}
 
 # 1) 本地服务：没起就静默拉起（隐藏窗口）
 function Test-Server {

@@ -19,7 +19,33 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::UserEvent;
 
-const DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../data");
+/// 运行数据目录：绿色版/便携版由启动器注入 ML_DATA_DIR；未注入时按 exe 位置回退：
+/// app/interview-orange.exe → 上一级/data；其他位置 → 同目录/data。
+/// 不再把编译期 CARGO_MANIFEST_DIR 烙进 exe，整目录搬迁后数据仍落在包内。
+pub fn data_dir() -> std::path::PathBuf {
+    if let Ok(v) = std::env::var("ML_DATA_DIR") {
+        if !v.trim().is_empty() {
+            let p = std::path::PathBuf::from(v);
+            if p.is_absolute() {
+                return p;
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                return cwd.join(p);
+            }
+            return p;
+        }
+    }
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let root = if base.file_name().and_then(|n| n.to_str()) == Some("app") {
+        base.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| base.clone())
+    } else {
+        base
+    };
+    root.join("data")
+}
 
 /// 46 项特性开关的本地替身（文档 24：服务端下发 → 客户端 if 判断）
 const FEATURE_KEYS: &[&str] = &[
@@ -56,6 +82,8 @@ pub struct AppState {
     pub focus_enabled: bool,
     pub overlay_visible: bool,
     pub last_error: String,
+    /// 浮窗分区（cmd_set_overlay_zones）：仅存储，供后续做点击穿透
+    pub zones: Vec<Value>,
 }
 
 impl AppState {
@@ -77,6 +105,7 @@ impl AppState {
             focus_enabled: false,
             overlay_visible: false,
             last_error: String::new(),
+            zones: Vec::new(),
         }
     }
 }
@@ -157,10 +186,11 @@ pub fn emit_flag(state: &Mutex<AppState>, event: &str, payload: Value) {
 }
 
 pub fn init(state: &Mutex<AppState>) {
-    let marker = format!("{}/.recovery", DATA_DIR);
-    let _ = std::fs::create_dir_all(DATA_DIR);
+    let data = data_dir();
+    let marker = data.join(".recovery");
+    let _ = std::fs::create_dir_all(&data);
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-    st.crash_recovery = std::path::Path::new(&marker).exists();
+    st.crash_recovery = marker.exists();
     let _ = std::fs::write(&marker, b"1");
 }
 
@@ -267,6 +297,18 @@ pub fn toggle_overlay(state: &Mutex<AppState>) -> bool {
 }
 
 pub fn panic_toggle(state: &Mutex<AppState>) {
+    // 小项3：features.set 的 stealth.panic=false 时 panic 热键不响应（仅存储以外的真实联动）
+    let enabled = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .features
+        .get("stealth.panic")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !enabled {
+        println!("[panic] 已被特性开关 stealth.panic 禁用");
+        return;
+    }
     let (hwnds, already) = {
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
         (st.hwnds.clone(), !st.hidden_by_panic.is_empty())
@@ -592,7 +634,7 @@ pub fn disguise_process(name: &str, launch: bool) -> Result<Value, String> {
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
     let safe = if safe.trim().is_empty() { "App".to_string() } else { safe };
-    let dir = format!("{}/disguise", DATA_DIR);
+    let dir = format!("{}/disguise", data_dir().to_string_lossy());
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("取当前 exe 失败: {e}"))?;
     let target = format!("{}/{}.exe", dir, safe);
@@ -619,16 +661,26 @@ pub fn disguise_process(name: &str, launch: bool) -> Result<Value, String> {
     }
 
     let mut launched = false;
+    let mut pid = 0u32;
     if launch {
-        if let Ok(mut child) = std::process::Command::new(&target).spawn() {
-            let pid = child.id();
-            let _ = child.wait();
-            launched = true;
-            println!("[disguise] 已以伪装名启动进程（pid={pid}）");
+        match std::process::Command::new(&target).spawn() {
+            Ok(mut child) => {
+                // 高危6：绝不能在 IPC 线程里 wait（伪装进程长驻，会永久阻塞前端 await）。
+                // 立即返回 pid；退出码由后台线程收割，避免僵尸进程。
+                pid = child.id();
+                launched = true;
+                let name = safe.clone();
+                std::thread::spawn(move || match child.wait() {
+                    Ok(code) => println!("[disguise] 伪装进程 {name} 已退出：{code}"),
+                    Err(e) => eprintln!("[disguise] 等待伪装进程退出失败: {e}"),
+                });
+                println!("[disguise] 已以伪装名启动进程（pid={pid}）");
+            }
+            Err(e) => eprintln!("[disguise] 启动失败: {e}"),
         }
     }
     println!("[disguise] 进程副本 → {target}");
-    Ok(json!({ "path": target, "name": safe, "launched": launched }))
+    Ok(json!({ "path": target, "name": safe, "launched": launched, "pid": pid }))
 }
 
 pub fn position_overlay(state: &Mutex<AppState>, x: i32, y: i32, w: i32, h: i32) -> bool {    let Some(hwnd) = hwnd_of(state, "overlay") else {
@@ -650,7 +702,10 @@ pub fn window_rect(state: &Mutex<AppState>, label: &str) -> Option<(i32, i32, i3
 
 /* ───────────── 截屏（GDI BitBlt → BMP data URL）───────────── */
 
-pub fn capture_screen() -> Result<String, String> {
+/// GDI BitBlt 截屏 → BMP data URL。
+/// max_width > 0 且屏幕更宽时做整点步长均值降采样（配色采样够用，IPC 体积降约两个数量级）；
+/// max_width = 0 保持全分辨率（笔试 OCR 的 cmd_capture_screen 走这条）。
+pub fn capture_screen(max_width: i32) -> Result<String, String> {
     unsafe {
         let screen = GetDC(None);
         if screen.is_invalid() {
@@ -691,21 +746,70 @@ pub fn capture_screen() -> Result<String, String> {
             return Err("GetDIBits 失败".into());
         }
 
-        let file_size = 54 + pixels.len();
+        // 可选降采样：step×step 块均值（BGR 序保持不变）
+        let mut out_width = width;
+        let mut out_height = height;
+        let mut out_pixels = std::mem::take(&mut pixels);
+        // 源缓冲行跨距：未降采样时仍是 GDI 的 4 字节对齐 stride，降采样后是紧密排列的 tw*3
+        let mut src_stride = stride;
+        if max_width > 0 && width > max_width {
+            let step = (width + max_width - 1) / max_width;
+            let tw = width / step;
+            let th = height / step;
+            let mut dst = vec![0u8; (tw * th * 3) as usize];
+            for dy in 0..th {
+                for dx in 0..tw {
+                    let (mut rb, mut gb, mut bb, mut n) = (0u64, 0u64, 0u64, 0u64);
+                    for sy in (dy * step)..((dy + 1) * step).min(height) {
+                        let row = (sy * stride) as usize;
+                        for sx in (dx * step)..((dx + 1) * step).min(width) {
+                            let p = row + (sx * 3) as usize;
+                            bb += out_pixels[p] as u64;
+                            gb += out_pixels[p + 1] as u64;
+                            rb += out_pixels[p + 2] as u64;
+                            n += 1;
+                        }
+                    }
+                    if n == 0 {
+                        n = 1;
+                    }
+                    let o = ((dy * tw + dx) * 3) as usize;
+                    dst[o] = (bb / n) as u8;
+                    dst[o + 1] = (gb / n) as u8;
+                    dst[o + 2] = (rb / n) as u8;
+                }
+            }
+            out_width = tw;
+            out_height = th;
+            out_pixels = dst;
+            src_stride = tw * 3;
+        }
+
+        // BMP 行须 4 字节对齐：按源行跨距逐行重排（不能假设源行紧密排列）
+        let out_stride = ((out_width * 3 + 3) / 4) * 4;
+        let row_bytes = (out_width * 3) as usize;
+        let mut bmp_px = vec![0u8; (out_stride * out_height) as usize];
+        for y in 0..out_height as usize {
+            let src = y * src_stride as usize;
+            bmp_px[y * out_stride as usize..y * out_stride as usize + row_bytes]
+                .copy_from_slice(&out_pixels[src..src + row_bytes]);
+        }
+
+        let file_size = 54 + bmp_px.len();
         let mut out = Vec::with_capacity(file_size);
         out.extend_from_slice(b"BM");
         out.extend_from_slice(&(file_size as u32).to_le_bytes());
         out.extend_from_slice(&[0, 0, 0, 0]);
         out.extend_from_slice(&54u32.to_le_bytes());
         out.extend_from_slice(&40u32.to_le_bytes());
-        out.extend_from_slice(&width.to_le_bytes());
-        out.extend_from_slice(&(-height).to_le_bytes());
+        out.extend_from_slice(&out_width.to_le_bytes());
+        out.extend_from_slice(&(-out_height).to_le_bytes());
         out.extend_from_slice(&1u16.to_le_bytes());
         out.extend_from_slice(&24u16.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(bmp_px.len() as u32).to_le_bytes());
         out.extend_from_slice(&[0u8; 16]);
-        out.extend_from_slice(&pixels);
+        out.extend_from_slice(&bmp_px);
 
         Ok(format!("data:image/bmp;base64,{}", base64(&out)))
     }
@@ -746,18 +850,18 @@ fn map_cmd(cmd: &str, args: &Value) -> (String, Value) {
         "cmd_overlay_session_ready" => Some(("overlay.session_ready", args_c.clone())),
         "cmd_release_session_if_not_ready" => Some(("overlay.release", args_c.clone())),
         "cmd_overlay_heartbeat" => Some(("native.ping", args_c.clone())),
-        "cmd_set_session_active" => Some(("native.ok", args_c.clone())),
+        "cmd_set_session_active" => Some(("native.unsupported", args_c.clone())),
         "cmd_set_overlay_interactive" => Some(("win.interactive", args_c.clone())),
         "cmd_set_overlay_size" => Some(("win.position", args_c.clone())),
         "cmd_position_overlay" => Some(("win.position", args_c.clone())),
-        "cmd_set_drag_active" => Some(("native.ok", args_c.clone())),
-        "cmd_set_overlay_zones" => Some(("native.ok", args_c.clone())),
-        "cmd_apply_overlay_styles" => Some(("native.ok", args_c.clone())),
+        "cmd_set_drag_active" => Some(("native.unsupported", args_c.clone())),
+        "cmd_set_overlay_zones" => Some(("overlay.zones", args_c.clone())),
+        "cmd_apply_overlay_styles" => Some(("native.unsupported", args_c.clone())),
         "cmd_capture_screen" => Some(("capture.screen", args_c.clone())),
         "cmd_capture_displays" => Some(("native.empty_array", args_c.clone())),
         "cmd_check_screen_capture_permission" => Some(("native.capture_permission", args_c.clone())),
         "cmd_request_screen_capture_permission" => Some(("native.capture_permission", args_c.clone())),
-        "cmd_open_screen_recording_settings" => Some(("native.ok", args_c.clone())),
+        "cmd_open_screen_recording_settings" => Some(("native.unsupported", args_c.clone())),
         "cmd_capture_protection_support" => Some(("stealth.support", args_c.clone())),
         "cmd_set_capture_excluded" => Some(("stealth.set", args_c.clone())),
         "cmd_set_panic_hotkey" => Some(("hotkeys.set", args_c.clone())),
@@ -780,21 +884,22 @@ fn map_cmd(cmd: &str, args: &Value) -> (String, Value) {
         "cmd_start_system_audio_capture" => Some(("audio.start", args_c.clone())),
         "cmd_stop_system_audio_capture" => Some(("audio.stop", args_c.clone())),
         "cmd_list_system_audio_outputs" => Some(("audio.devices", args_c.clone())),
-        "cmd_set_system_audio_excluded_outputs" => Some(("native.ok", args_c.clone())),
+        "cmd_set_system_audio_excluded_outputs" => Some(("native.unsupported", args_c.clone())),
         "cmd_get_cursor_pos" => Some(("win.cursor", args_c.clone())),
-        "cmd_set_cursor_point_feed" => Some(("native.ok", args_c.clone())),
+        "cmd_set_cursor_point_feed" => Some(("native.unsupported", args_c.clone())),
         "cmd_is_crash_recovery" => Some(("crash.is", args_c.clone())),
         "cmd_is_recovered_boot" => Some(("crash.booted", args_c.clone())),
         "cmd_read_native_crash" | "cmd_clear_native_crash" | "cmd_pending_newer_version"
         | "cmd_get_demo_visible_mode" | "cmd_set_demo_visible_mode" | "cmd_exam_window_snapshot"
         | "cmd_update_state" => Some(("native.null", args_c.clone())),
         "cmd_take_webview_crashes" | "cmd_read_recent_logs" => Some(("native.empty_array", args_c.clone())),
-        "cmd_relaunch" => Some(("native.ok", args_c.clone())),
+        // 高危7：cmd_relaunch 真正重启（spawn 自身 + exit），不再 native.ok 假装成功
+        "cmd_relaunch" => Some(("native.relaunch", args_c.clone())),
         "cmd_update_download" | "cmd_update_install" | "cmd_update_reveal" => {
             Some(("native.unsupported", args_c.clone()))
         }
         "cmd_start_native_exam_osd" | "cmd_stop_native_exam_osd" | "cmd_start_auth_listener" => {
-            Some(("native.ok", args_c.clone()))
+            Some(("native.unsupported", args_c.clone()))
         }
         _ => None,
     };
@@ -827,6 +932,12 @@ pub fn handle_ipc(
     if std::env::var("ML_IPCLOG").ok().as_deref() == Some("1") {
         println!("[ipc] {cmd} ← {label}");
     }
+    // 高危7：按 label 分级。map_cmd 已把 cmd_* 别名映射到内部名，这里按内部名校验即可。
+    // overlay 是更暴露的窗口（可被拖到任意位置），只放行浮窗所需最小集；
+    // main 与 on_new_window 新开的房间窗（web-*，房间页与主窗同级）放行全部。
+    if !cmd_allowed_for_label(label, cmd, &args) {
+        return Some((id, false, json!(format!("命令不被允许: {cmd}（label={label}）"))));
+    }
 
     match cmd {
         /* 通用占位（供原版 cmd_* 复用） */
@@ -837,7 +948,8 @@ pub fn handle_ipc(
         "native.ping" => Some((id, true, json!(now_millis()))),
         "native.capture_permission" => Some((id, true, json!({ "granted": true, "canAsk": true }))),
         "stealth.support" => Some((id, true, json!({ "wda": true, "platform": "win32" }))),
-        "hotkeys.status" => Some((id, true, json!({ "registered": true, "hotkey": "Ctrl+Alt+Esc" }))),
+        // P1-4：返回真实注册结果，不再写死 Ctrl+Alt+Esc
+        "hotkeys.status" => Some((id, true, crate::hooks::hotkey_status())),
         "crash.is" => Some((id, true, json!(state.lock().unwrap_or_else(|e| e.into_inner()).crash_recovery))),
         "crash.booted" => Some((id, true, json!(state.lock().unwrap_or_else(|e| e.into_inner()).boot_ok))),
         "win.show_label" => {
@@ -870,14 +982,25 @@ pub fn handle_ipc(
                 "shell": "rust-tauri2",
                 "native": true,
                 "platform": "win32",
-                "base": crate::BASE,
+                "base": crate::base_url(),
                 "wda": st.wda,
                 "crashRecovery": st.crash_recovery,
             })))
         }
         "overlay.show" => {
+            // P0-3：先记下采纳前的 seq；set_overlay_visible 内部已 +1（同一次显示只算一次）
+            let prev = state.lock().unwrap_or_else(|e| e.into_inner()).seq;
             set_overlay_visible(state, true);
-            let seq = state.lock().unwrap_or_else(|e| e.into_inner()).seq;
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            // 前端传来的 seq 仅在「比采纳前大且增量 ≤ 100」时采纳（正常每次 +1）；
+            // Date.now() 级的 13 位时间戳直接忽略，避免原生 seq 永久错位
+            let incoming = args.get("seq").and_then(|x| x.as_i64()).filter(|&s| s > 0);
+            match incoming {
+                Some(s) if s > prev && s - prev <= 100 => st.seq = s,
+                Some(s) => println!("[overlay] 忽略异常 seq={s}（采纳前 {prev}，当前 {}）", st.seq),
+                None => {}
+            }
+            let seq = st.seq;
             Some((id, true, json!({ "seq": seq })))
         }
         "overlay.hide" => {
@@ -969,10 +1092,13 @@ pub fn handle_ipc(
             let st = state.lock().unwrap_or_else(|e| e.into_inner());
             Some((id, true, json!(st.hwnds.keys().cloned().collect::<Vec<_>>())))
         }
-        "capture.screen" => match capture_screen() {
-            Ok(url) => Some((id, true, json!(url))),
-            Err(e) => Some((id, false, json!(e))),
-        },
+        "capture.screen" => {
+            let max_width = args.get("maxWidth").and_then(|x| x.as_i64()).map(|x| x as i32).unwrap_or(0);
+            match capture_screen(max_width) {
+                Ok(url) => Some((id, true, json!(url))),
+                Err(e) => Some((id, false, json!(e))),
+            }
+        }
         "audio.start" => {
             let min_level = args.get("minLevel").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
             crate::audio::start(min_level);
@@ -993,7 +1119,13 @@ pub fn handle_ipc(
         "hotkeys.set" => {
             let list = args.get("list").cloned().unwrap_or(json!([]));
             let ok = crate::hooks::set_hotkeys(&list);
-            Some((id, true, json!({ "ok": ok, "count": list.as_array().map(|a| a.len()).unwrap_or(0) })))
+            // 返回真实注册结果（P1-4）：前端用它展示「实际生效的热键」
+            let status = crate::hooks::hotkey_status();
+            Some((id, true, json!({
+                "ok": ok,
+                "count": list.as_array().map(|a| a.len()).unwrap_or(0),
+                "registered": status.get("items").cloned().unwrap_or(json!([])),
+            })))
         }
         "crash.recovery" => {
             let st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1006,15 +1138,44 @@ pub fn handle_ipc(
         }
         "crash.boot_ok" => {
             state.lock().unwrap_or_else(|e| e.into_inner()).boot_ok = true;
-            let _ = std::fs::remove_file(format!("{}/.recovery", DATA_DIR));
+            let _ = std::fs::remove_file(data_dir().join(".recovery"));
             Some((id, true, json!({ "ok": true })))
         }
         "features.list" => Some((id, true, json!(state.lock().unwrap_or_else(|e| e.into_inner()).features))),
         "features.set" => {
             let key = args.get("key").and_then(|x| x.as_str()).unwrap_or("");
             let value = args.get("value").cloned().unwrap_or(Value::Bool(true));
+            // 小项3：stealth.wda 真正联动 set_wda（主窗+浮窗）；stealth.panic 由 panic_toggle 读取；
+            // 其余键仅存储供前端判断，不驱动原生行为
+            if key == "stealth.wda" {
+                let enable = value.as_bool().unwrap_or(true);
+                for lbl in ["main", "overlay"] {
+                    set_wda(state, lbl, enable);
+                }
+            }
             state.lock().unwrap_or_else(|e| e.into_inner()).features.insert(key.to_string(), value.clone());
-            Some((id, true, json!({ "key": key, "value": value })))
+            Some((id, true, json!({ "key": key, "value": value, "applied": key == "stealth.wda" })))
+        }
+        /* 浮窗分区：仅存储进 AppState（后续做点击穿透用），不假装成功执行穿透 */
+        "overlay.zones" => {
+            let zones = args.get("zones").cloned().unwrap_or(json!([]));
+            let count = zones.as_array().map(|a| a.len()).unwrap_or(0);
+            state.lock().unwrap_or_else(|e| e.into_inner()).zones = zones.as_array().cloned().unwrap_or_default();
+            Some((id, true, json!({ "stored": true, "count": count })))
+        }
+        /* cmd_relaunch：真正重启（spawn 自身 + exit(0)），绝不返回假成功 */
+        "native.relaunch" => {
+            let exe = std::env::current_exe().map_err(|e| format!("无法定位当前 exe: {e}"));
+            match exe {
+                Ok(path) => match std::process::Command::new(&path).spawn() {
+                    Ok(child) => {
+                        println!("[relaunch] 已拉起新进程 pid={}，当前进程退出", child.id());
+                        std::process::exit(0);
+                    }
+                    Err(e) => Some((id, false, json!(format!("重启失败: {e}")))),
+                },
+                Err(e) => Some((id, false, json!(e))),
+            }
         }
         "window.close" => {
             let target = args.get("label").and_then(|x| x.as_str()).unwrap_or("overlay");
@@ -1025,4 +1186,29 @@ pub fn handle_ipc(
         }
         other => Some((id, false, json!(format!("未知命令: {other}（label={label}）")))),
     }
+}
+
+/// 高危7：overlay 窗口的 IPC 白名单（内部名口径；cmd_* 别名经 map_cmd 后再校验）。
+/// 注意：capture.screen / win.disguise_process / win.list / hotkeys.set / crash.* 刻意不放行——
+/// 浮窗自动配色（Ctrl+Alt+P）因此退化为提示文案，属预期收窄；主窗仍可全量调用。
+fn cmd_allowed_for_label(label: &str, cmd: &str, args: &Value) -> bool {
+    if label != "overlay" {
+        // main 与 on_new_window 新开的房间窗 web-*：房间页（#mock / #mock-exam）与主窗同级
+        return true;
+    }
+    const OVERLAY_CMDS: &[&str] = &[
+        "overlay.show", "overlay.hide", "overlay.toggle", "overlay.seq",
+        "overlay.session_ready", "overlay.release", "overlay.close", "overlay.zones",
+        "win.rect", "win.position", "win.interactive",
+        "stealth.set", "native.info", "native.ping", "native.ok",
+        "audio.start", "audio.stop", "audio.level", "audio.devices",
+    ];
+    if !OVERLAY_CMDS.contains(&cmd) {
+        return false;
+    }
+    // stealth.set：浮窗只允许改自己的防截屏
+    if cmd == "stealth.set" {
+        return args.get("kind").and_then(|x| x.as_str()).unwrap_or("overlay") == "overlay";
+    }
+    true
 }

@@ -4,8 +4,10 @@
 //! 全部 `cmd_*` 原生能力（文档 05/15/24）经 `win.rs` 实现，经单一 `ipc` 命令分发，
 //! 前端 shim（orangeNative）走 `window.__TAURI_INTERNALS__.invoke`。
 //!
-//! 隔离约定：工具链在 ../.tools，构建产物经 D:\ml-build junction → ../.tools/target，
-//! 运行数据在 ../data；不写系统 PATH / 注册表 / 全局目录。
+//! 隔离约定：工具链在 ../.tools，构建产物在 ../.tools/target（中文路径时由
+//! native/run.ps1 在盘符根自动创建 ASCII junction 中转），运行数据在 ML_DATA_DIR
+//! （默认包内 data/，绿色版由启动器注入绝对路径）；不写系统 PATH / 注册表 / 全局目录。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
 mod hooks;
@@ -28,7 +30,15 @@ pub enum UserEvent {
     AudioSegment(Vec<u8>),
 }
 
-pub const BASE: &str = "http://127.0.0.1:8756";
+/// 本地服务地址：跟随 ML_PORT 环境变量（默认 8756），与 node 服务端、启动器口径一致；
+/// native/run.ps1 启动 exe 前会按 -Port 参数注入。
+pub fn base_url() -> String {
+    let port = std::env::var("ML_PORT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "8756".to_string());
+    format!("http://127.0.0.1:{port}")
+}
 
 static MAX_LEVEL: AtomicU32 = AtomicU32::new(0);
 
@@ -59,7 +69,7 @@ fn shim_js() -> &'static str {
     disguiseTitle: function(title){ return invoke('win.disguise', { title: title }); },
     disguiseProcess: function(name, launch){ return invoke('win.disguise_process', { name: name, launch: !!launch }); },
     panic: function(){ return invoke('stealth.panic'); },
-    captureScreen: function(){ return invoke('capture.screen'); },
+    captureScreen: function(o){ return invoke('capture.screen', o || {}); },
     audioStart: function(o){ return invoke('audio.start', o || {}); },
     audioStop: function(){ return invoke('audio.stop'); },
     audioLevel: function(){ return invoke('audio.level'); },
@@ -88,6 +98,12 @@ fn ipc(
     state: tauri::State<Arc<Mutex<AppState>>>,
 ) -> Result<Value, String> {
     let label = window.label().to_string();
+    // P0-4：IPC 只接受自家页面（SPA 的 "/" 与 "/legacy"）——上传目录等其它同源路径
+    // 即使被浏览到、或被 window.open 打开（新窗口带 shim），也不给原生能力。
+    let page_path = window.url().map(|u| u.path().to_string()).unwrap_or_default();
+    if page_path != "/" && page_path != "/legacy" {
+        return Err(format!("IPC 来源页面不被允许: {page_path}"));
+    }
     let body = json!({ "id": 0, "cmd": cmd, "args": args.unwrap_or(Value::Null) }).to_string();
     match win::handle_ipc(&state, &label, &body) {
         Some((_, true, v)) => Ok(v),
@@ -134,25 +150,40 @@ fn main() {
 
             // ── 窗口（main + 预建 overlay，对齐原版「窗口由 Rust 侧预建」）──
             // WebView2 用户数据目录放项目内（默认 %LOCALAPPDATA% 在受限环境下拒绝访问）
-            let wv_data = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../data/webview"));
+            let wv_data = win::data_dir().join("webview");
             let _ = std::fs::create_dir_all(&wv_data);
+
+            let base = base_url();
+
+            // ── P0-1：window.open 处理器。wry 未注册 on_new_window 时 NewWindowRequested
+            // 会被 SetHandled(true) 静默丢弃，所有房间入口（#mock / #mock-exam / #overlay）都打不开。
+            // 新窗口：同一 data_directory（Windows 下必须同 WebView2 environment）、
+            // 同一 initialization_script（否则新窗口没有 orangeNative）、window_features 继承尺寸/位置。
+            let wv_main = wv_data.clone();
+            let wv_overlay = wv_data.clone();
+            let h_main = app.handle().clone();
+            let h_overlay = app.handle().clone();
+            let base_nav = base.clone();
+            let base_nav_ov = base.clone();
 
             let main_w = WebviewWindowBuilder::new(
                 app,
                 "main",
-                WebviewUrl::External(format!("{BASE}/#main").parse().unwrap()),
+                WebviewUrl::External(format!("{base}/#main").parse().unwrap()),
             )
             .title("面试橙 · 工作台")
             .inner_size(1280.0, 860.0)
             .min_inner_size(980.0, 640.0)
             .data_directory(wv_data.clone())
             .initialization_script(shim_js())
+            .on_navigation(move |url: &tauri::Url| nav_allowed(&base_nav, url))
+            .on_new_window(move |url, features| open_new_window(&h_main, wv_main.clone(), url, features))
             .build()?;
 
             let overlay_w = WebviewWindowBuilder::new(
                 app,
                 "overlay",
-                WebviewUrl::External(format!("{BASE}/#overlay").parse().unwrap()),
+                WebviewUrl::External(format!("{base}/#overlay").parse().unwrap()),
             )
             .title("面试橙 · 浮窗")
             .inner_size(420.0, 640.0)
@@ -164,6 +195,8 @@ fn main() {
             .transparent(true) // OS 级透明：桌面透过 CSS 半透明卡片可见（对齐原版浮窗）
             .data_directory(wv_data.clone())
             .initialization_script(shim_js())
+            .on_navigation(move |url: &tauri::Url| nav_allowed(&base_nav_ov, url))
+            .on_new_window(move |url, features| open_new_window(&h_overlay, wv_overlay.clone(), url, features))
             .build()?;
 
             win::set_hwnd(&state, "main", main_w.hwnd()?.0 as isize);
@@ -193,9 +226,10 @@ fn main() {
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .seq;
-                            // 经 BroadcastChannel 通知浮窗页面进入预览态/隐藏态（跨 webview 生效）
+                            // P0-2：显隐热键只广播 shown/hidden，不带 mode:'preview'、不伪造
+                            // sessionId —— 浮窗收到后仅当作「窗口被重新显示」，保持当前会话与模式
                             let msg = format!(
-                                "(function(){{try{{var b=new BroadcastChannel('interview-orange-bus');b.postMessage({{type:'{}',seq:{},mode:'preview'}});b.close();}}catch(e){{}}}})()",
+                                "(function(){{try{{var b=new BroadcastChannel('interview-orange-bus');b.postMessage({{type:'{}',seq:{}}});b.close();}}catch(e){{}}}})()",
                                 if now_on { "overlay-shown" } else { "overlay-hidden" },
                                 seq
                             );
@@ -218,7 +252,8 @@ fn main() {
                             println!("[hotkey] 退出");
                             std::process::exit(0);
                         }
-                        _ => {}
+                        // P1-4：未内置处理的热键动作不再静默丢弃，仅转发 native-hotkey 事件给前端
+                        other => println!("[hotkey] 动作「{other}」无内置处理，转发 native-hotkey 事件"),
                     }
                     let script = format!(
                         "window.__ORANGE_EMIT__('native-hotkey', {})",
@@ -296,11 +331,11 @@ fn main() {
     q.push('h=' + Math.round(shell.getBoundingClientRect().height));
     q.push('op=' + cs.opacity + '/' + cs.display + '/' + cs.visibility);
   }
-  location.href = 'http://127.0.0.1:8756/__diag?r=' + q.join('~');
-})();"#;
+  location.href = '{BASE_URL}/__diag?r=' + q.join('~');
+})();"#.replace("{BASE_URL}", &base_url());
                     for label in ["main", "overlay"] {
                         match h.get_webview_window(label) {
-                            Some(w) => match w.eval(script) {
+                            Some(w) => match w.eval(&script) {
                                 Ok(_) => println!("[diag] eval 已下发 → {label}"),
                                 Err(e) => println!("[diag] eval 失败 → {label}: {e}"),
                             },
@@ -324,13 +359,13 @@ fn main() {
                     let _ = ShowWindow(hw, SW_SHOWNOACTIVATE);
                     let _ = SetWindowDisplayAffinity(hw, WDA_EXCLUDEFROMCAPTURE);
                     std::thread::sleep(std::time::Duration::from_millis(1500));
-                    let with_wda = win::capture_screen().unwrap_or_default();
+                    let with_wda = win::capture_screen(0).unwrap_or_default();
                     println!("[selftest] WDA 开启时截屏：{} 字节(base64)", with_wda.len());
 
                     println!("[selftest] 关闭 WDA 再截屏");
                     let _ = SetWindowDisplayAffinity(hw, WDA_NONE);
                     std::thread::sleep(std::time::Duration::from_millis(1200));
-                    let without_wda = win::capture_screen().unwrap_or_default();
+                    let without_wda = win::capture_screen(0).unwrap_or_default();
                     println!("[selftest] WDA 关闭时截屏：{} 字节(base64)", without_wda.len());
 
                     let diff = if with_wda.len() == without_wda.len() {
@@ -436,6 +471,59 @@ fn eval_all(handle: &tauri::AppHandle, label: Option<&str>, script: &str) {
     for t in targets {
         if let Some(w) = handle.get_webview_window(&t) {
             let _ = w.eval(script);
+        }
+    }
+}
+
+/// 导航白名单（高危 6 配套）：只允许本服务 origin；about:blank 供新建窗口初始化用
+fn nav_allowed(base: &str, url: &tauri::Url) -> bool {
+    if url.as_str() == "about:blank" {
+        return true;
+    }
+    let ok = base
+        .parse::<tauri::Url>()
+        .map(|b| b.origin() == url.origin())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("[native] 拒绝导航：{url}");
+    }
+    ok
+}
+
+/// P0-1：window.open 的新窗口。WebView2 在 SetNewWindow 后会把目标 URL 导航进该窗口，
+/// 所以这里先以 about:blank 建窗；尺寸/位置由 window_features 继承，下限 980x640（房间页是宽布局）。
+/// 构建失败时返回 Deny（拒绝比静默丢弃可见）。新窗口 label 为 web-<n>，IPC 按 main 级别处理。
+fn open_new_window(
+    handle: &tauri::AppHandle,
+    wv_data: std::path::PathBuf,
+    url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> tauri::webview::NewWindowResponse<tauri::Wry> {
+    static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+    let label = format!("web-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+    let base = base_url();
+    let h = handle.clone();
+    let wv = wv_data.clone();
+    let builder = WebviewWindowBuilder::new(
+        handle,
+        &label,
+        WebviewUrl::External("about:blank".parse().unwrap()),
+    )
+    .title("面试橙 · 房间")
+    .data_directory(wv_data.clone())
+    .initialization_script(shim_js())
+    .window_features(features)
+    .min_inner_size(980.0, 640.0)
+    .on_navigation(move |u: &tauri::Url| nav_allowed(&base, u))
+    .on_new_window(move |u, f| open_new_window(&h, wv.clone(), u, f));
+    match builder.build() {
+        Ok(w) => {
+            println!("[native] 新窗口 {label} → {url}");
+            tauri::webview::NewWindowResponse::Create { window: w }
+        }
+        Err(e) => {
+            eprintln!("[native] 新窗口创建失败（拒绝 {url}）：{e}");
+            tauri::webview::NewWindowResponse::Deny
         }
     }
 }

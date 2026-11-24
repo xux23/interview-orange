@@ -1,9 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { api, getToken, locale, currentUser } from '../api/client';
+import { api, getToken, getSocketToken, locale, currentUser } from '../api/client';
 import { Markdown } from '../lib/markdown.jsx';
-import { publish } from '../lib/bridge';
+import { overlayWindow, publish } from '../lib/bridge';
 import { startVoiceCapture } from '../lib/voice';
+
+const scoreBand = (score) => {
+  const n = Number(score);
+  if (!Number.isFinite(n)) return '—';
+  if (n >= 90) return '优秀';
+  if (n >= 80) return '良好';
+  if (n >= 70) return '一般';
+  if (n >= 60) return '需改进';
+  return '不足';
+};
 
 export default function MockRoom({ user }) {
   const params = useMemo(() => new URLSearchParams(location.hash.split('?')[1] || ''), []);
@@ -21,12 +31,15 @@ export default function MockRoom({ user }) {
   const [micOn, setMicOn] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
   const [micErr, setMicErr] = useState('');
+  const [asrModel, setAsrModel] = useState('mock');
   const stopMicRef = useRef(null);
   const socketRef = useRef(null);
   const bodyRef = useRef(null);
+  const startedRef = useRef(false);
 
   useEffect(() => {
     if (!sessionId) return;
+    fetch('/healthz').then((r) => r.json()).then((h) => setAsrModel(h.asr || 'mock')).catch(() => {});
     api.query('session.getSession', { id: sessionId }).then((s) => {
       setSession(s);
       setStatus(s.status);
@@ -35,14 +48,18 @@ export default function MockRoom({ user }) {
     }).catch(() => {});
 
     const socket = io('/', {
-      auth: { token: getToken(), locale: locale(), sessionId },
+      auth: { token: getToken(), socketToken: getSocketToken(), locale: locale(), sessionId },
       transports: ['websocket', 'polling'],
     });
     socketRef.current = socket;
     socket.on('connect', () => {
       setConnected(true);
       socket.emit('mock.join', {});
-      socket.emit('mock.start', {});
+      // P1-7：重连不再重复 mock.start（服务端也有按会话的幂等保护）
+      if (!startedRef.current) {
+        startedRef.current = true;
+        socket.emit('mock.start', {});
+      }
     });
     socket.on('connect_error', (e) => console.warn('socket error', e.message));
 
@@ -70,6 +87,11 @@ export default function MockRoom({ user }) {
       });
     });
     socket.on('audio.permission', () => {});
+    // 服务端模型失败（出题/答题）直接推送错误，不再静默降级
+    socket.on('ai.error', (e) => {
+      setDraftAnswer('');
+      setItems((list) => [...list, { role: 'SYSTEM', content: `⚠ ${e?.message || 'AI 生成失败'}` }]);
+    });
     // 语音作答：服务端转写完成后按 self 说话人广播；本地同步展示
     socket.on('stt.segment', (seg) => {
       if (seg?.completed && seg.speakerId === 'self' && seg.text) {
@@ -117,6 +139,10 @@ export default function MockRoom({ user }) {
 
   const toggleMic = async () => {
     setMicErr('');
+    if (asrModel === 'mock') {
+      setMicErr('未配置 ML_ASR_API_KEY，当前为本地模拟语音识别，请改用文字作答');
+      return;
+    }
     if (micOn) {
       stopMicRef.current?.();
       stopMicRef.current = null;
@@ -153,6 +179,11 @@ export default function MockRoom({ user }) {
     return <div style={{ padding: 30 }}><h3>没有会话参数</h3><p className="muted">请从主工作台「模拟面试」创建会话。</p></div>;
   }
 
+  const reportSummary = report?.interviewSummary || {};
+  const dimensions = Array.isArray(reportSummary.fiveDimensions) ? reportSummary.fiveDimensions : [];
+  const conversation = Array.isArray(report?.conversationAnalysis) ? report.conversationAnalysis : [];
+  const hasScore = report?.score != null && Number.isFinite(Number(report.score));
+
   return (
     <div className="room">
       <div className="room-head">
@@ -161,11 +192,14 @@ export default function MockRoom({ user }) {
         <small className="muted">{session?.goal?.name} · {session?.resume?.title}</small>
         <span className="spacer" />
         <small className="muted">{connected ? '已连接 socket' : '连接中…'}</small>
-        <button className={`btn sm ${micOn ? 'primary' : 'ghost'}`} disabled={status !== 'ACTIVE'} onClick={toggleMic}>
+        {asrModel === 'mock' && <small className="muted" title="未配置 ML_ASR_API_KEY，语音作答不可用">语音未配置</small>}
+        <button className={`btn sm ${micOn ? 'primary' : 'ghost'}`} disabled={status !== 'ACTIVE' || asrModel === 'mock'} onClick={toggleMic}>
           {micOn ? '⏹ 停止语音' : '🎤 语音作答'}
         </button>
         <button className="btn ghost sm" onClick={toggleAssist}>{assist ? '关闭辅助' : '开启辅助'}</button>
-        <button className="btn sm" onClick={() => { publish({ type: 'overlay-shown', seq: Date.now(), mode: 'interview', sessionId }); window.open(`#overlay`, 'ml-overlay', 'popup=1,width=420,height=640'); }}>浮窗</button>
+        {/* P0-3：走统一入口 overlayWindow.open（原生壳显示预建浮窗、浏览器开弹窗），
+            不再手写 publish({seq: Date.now()})（13 位时间戳会污染原生 seq 门禁） */}
+        <button className="btn sm" onClick={() => overlayWindow.open({ mode: 'interview', sessionId })}>浮窗</button>
         <button className="btn primary sm" disabled={busy || status !== 'ACTIVE'} onClick={finish}>{busy ? '生成中…' : '结束并生成报告'}</button>
       </div>
 
@@ -185,10 +219,22 @@ export default function MockRoom({ user }) {
         {micErr && <div className="msg system" style={{ color: '#c0392b', fontSize: 12 }}>🎤 {micErr}</div>}
         {status === 'COMPLETED' && report && (
           <div className="card pad" style={{ alignSelf: 'stretch' }}>
-            <div className="row"><b>复盘报告：{report.score} 分（{report.grade}）</b><span className="spacer" />
+            <div className="row"><b>{hasScore ? `复盘报告：${report.score} 分（${scoreBand(report.score)}）` : '复盘报告'}</b><span className="spacer" />
               <button className="btn sm" onClick={() => window.close()}>关闭窗口</button></div>
-            <p className="muted">{report.summary}</p>
-            {(report.dimensions || []).map((d) => <div key={d.key} className="tiny">· {d.label} {d.score}/100 — {d.comment}</div>)}
+            {reportSummary.interviewSummary
+              ? <p className="muted">{reportSummary.interviewSummary}</p>
+              : report.status && <p className="muted">报告状态：{report.status}</p>}
+            {dimensions.map((d) => <div key={d.dimension} className="tiny">· {d.dimension} {d.score}/100 — {d.comment}</div>)}
+            {conversation.length > 0 && (
+              <div style={{ marginTop: 10 }}>
+                <b>逐段点评（{conversation.length} 段）</b>
+                {conversation.map((seg, i) => (
+                  <div key={i} className="tiny" style={{ marginTop: 4 }}>
+                    · {seg.topic} {seg.score}/100 — {seg.evaluation}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -199,7 +245,10 @@ export default function MockRoom({ user }) {
           value={answer}
           disabled={status !== 'ACTIVE'}
           onChange={(e) => setAnswer(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } }}
+          onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return; // 小项5：IME 组合中不发送
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+          }}
         />
         <button className="btn primary" disabled={status !== 'ACTIVE' || !answer.trim()} onClick={send}>发送</button>
       </div>

@@ -2,11 +2,8 @@
 export const native = typeof window !== 'undefined' ? window.orangeNative || null : null;
 export const isNative = Boolean(native?.native);
 
-let hiddenBySelf = false;
-
 /** 隐藏浮窗（保留窗口，之后可 showInactive 复用） */
 export async function hideOverlayWindow() {
-  hiddenBySelf = true;
   try {
     if (native?.toggleOverlay) return await native.toggleOverlay(false);
     window.close();
@@ -17,7 +14,6 @@ export async function hideOverlayWindow() {
 
 /** 彻底关闭浮窗窗口（× 关闭） */
 export async function closeOverlayWindow() {
-  hiddenBySelf = true;
   try {
     if (native?.closeOverlay) return await native.closeOverlay();
     window.close();
@@ -54,4 +50,3 @@ export async function panicToggle() {
   return null;
 }
 
-export const wasHiddenBySelf = () => hiddenBySelf;

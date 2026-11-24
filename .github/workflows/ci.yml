@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 语法闸门（server 全量）
+        run: |
+          find server -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: 依赖与前端构建
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: 干净 clone 构建检查
+        run: node scripts/check-clean-clone.mjs
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - name: 启动服务并验证鉴权闸门
+        run: |
+          ML_PORT=8799 ML_DATA_DIR="$PWD/.ci-data" node server/index.js &
+          for i in $(seq 1 40); do curl -sf http://127.0.0.1:8799/healthz >/dev/null && break; sleep 0.5; done
+          curl -s http://127.0.0.1:8799/healthz | grep -q '"auth":"required"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/trpc/user.getUserInfo)" = "401"
+          curl -s http://127.0.0.1:8799/ | grep -q '__ML_ENV__'
+
+# 说明：原生壳（Rust/Tauri）需要 Windows + 项目内 .tools 工具链（约 5.7GB，不入库），
+# 因此 CI 只做服务端与前端；原生壳的构建验证走 native/run.ps1 -Build -BuildOnly + scripts/check-clean-clone.mjs（Windows 本地）。

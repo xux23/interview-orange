@@ -11,6 +11,58 @@ const ROUNDS = ['FIRST', 'SECOND', 'THIRD', 'HR', 'OTHER'];
 const AUDIO = ['MICROPHONE', 'SPEAKER', 'PHONE'];
 const pass = z.object({}).passthrough();
 
+/* P1-7：同会话并发收尾（socket mock.end 与 tRPC completeSession 同时到达）只跑一次 */
+const finalizing = new Set();
+/* P1-11：报告生成单飞表（getSessionReport 与 finalizeSession 共用同一会话的生成结果） */
+const reportJobs = new Map();
+
+function generateReportOnce(sessionId, row, ctx, { withMeta = false } = {}) {
+  if (reportJobs.has(sessionId)) return reportJobs.get(sessionId);
+  const job = (async () => {
+    const messages = all('SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC', sessionId)
+      .map((m) => ({ id: m.id, role: m.role, content: m.content, metadata: withMeta ? fromJson(m.metadata, null) : undefined, createdAt: m.created_at }));
+    const report = await reportFor(row, messages, ctx);
+    run('UPDATE sessions SET report=? WHERE id=?', toJson(report), sessionId);
+    return report;
+  })();
+  reportJobs.set(sessionId, job);
+  job.finally(() => reportJobs.delete(sessionId)).catch(() => {});
+  return job;
+}
+
+/** 结束会话并生成报告（socket 的 mock.end 与 tRPC 的 completeSession 共用同一套逻辑）。
+ *  幂等：已 COMPLETED（或正在收尾中等待完成）直接返回当前 DTO。 */
+export async function finalizeSession(sessionId, userId) {
+  const row = one('SELECT * FROM sessions WHERE id=? AND user_id=?', sessionId, userId);
+  if (!row) return null;
+  if (row.status === 'COMPLETED') return sessionDto(row);
+  if (finalizing.has(sessionId)) {
+    // 已在生成中：等它落库（报告生成可能要数秒）
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      const cur = one('SELECT * FROM sessions WHERE id=?', sessionId);
+      if (cur?.status === 'COMPLETED') return sessionDto(cur);
+    }
+    return sessionDto(one('SELECT * FROM sessions WHERE id=?', sessionId));
+  }
+  finalizing.add(sessionId);
+  try {
+    const ctx = buildContext(userId, { resumeId: row.resume_id, goalId: row.goal_id, materialIds: fromJson(row.metadata, {})?.materialIds });
+    // P1-11：与 getSessionReport 共用单飞生成（同一会话只跑一次模型）
+    await generateReportOnce(sessionId, row, ctx, { withMeta: true });
+    const now = nowIso();
+    const realDuration = Math.max(1, Math.round((Date.now() - Date.parse(row.created_at)) / 1000));
+    run('UPDATE sessions SET status=?, updated_at=?, completed_at=?, real_duration=?, report=? WHERE id=?',
+      'COMPLETED', now, now, realDuration, toJson(report), sessionId);
+    if (row.type === 'MOCK_INTERVIEW') {
+      run('UPDATE users SET mock_interview_count = MAX(0, mock_interview_count - 1) WHERE id=?', userId);
+    }
+    return sessionDto(one('SELECT * FROM sessions WHERE id=?', sessionId));
+  } finally {
+    finalizing.delete(sessionId);
+  }
+}
+
 export function sessionDto(row, { withMessages = true } = {}) {
   if (!row) return null;
   const goal = row.goal_id ? one('SELECT * FROM goals WHERE id=?', row.goal_id) : null;
@@ -120,9 +172,11 @@ export default {
     kind: 'query',
     input: z.object({ type: z.enum(TYPES) }).passthrough().optional(),
     handler: (input, { user }) => {
+      // P1-7：ACTIVE 但已过 expires_at（createSession 写 now+2h）的会话不再返回
+      const now = nowIso();
       const row = input?.type
-        ? one('SELECT * FROM sessions WHERE user_id=? AND type=? AND status=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1', user.id, input.type, 'ACTIVE')
-        : one('SELECT * FROM sessions WHERE user_id=? AND status=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1', user.id, 'ACTIVE');
+        ? one('SELECT * FROM sessions WHERE user_id=? AND type=? AND status=? AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1', user.id, input.type, 'ACTIVE', now)
+        : one('SELECT * FROM sessions WHERE user_id=? AND status=? AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 1', user.id, 'ACTIVE', now);
       return sessionDto(row);
     },
   },
@@ -173,22 +227,10 @@ export default {
     kind: 'mutation',
     input: z.object({ id: z.string() }).passthrough(),
     handler: async ({ id }, { user }) => {
-      const row = one('SELECT * FROM sessions WHERE id=? AND user_id=?', id, user.id);
-      if (!row) throw new TRPCError('会话不存在', 'NOT_FOUND');
-      if (row.status === 'COMPLETED') return sessionDto(row);
-      const startedAt = Date.parse(row.created_at);
-      const realDuration = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-      const ctx = buildContext(user.id, { resumeId: row.resume_id, goalId: row.goal_id, materialIds: fromJson(row.metadata, {})?.materialIds });
-      const messages = all('SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC', id)
-        .map((m) => ({ id: m.id, role: m.role, content: m.content, metadata: fromJson(m.metadata, null), createdAt: m.created_at }));
-      const report = await reportFor(row, messages, ctx);
-      const now = nowIso();
-      run('UPDATE sessions SET status=?, updated_at=?, completed_at=?, real_duration=?, report=? WHERE id=?',
-        'COMPLETED', now, now, realDuration, toJson(report), id);
-      if (row.type === 'MOCK_INTERVIEW') {
-        run('UPDATE users SET mock_interview_count = MAX(0, mock_interview_count - 1) WHERE id=?', user.id);
-      }
-      return sessionDto(one('SELECT * FROM sessions WHERE id=?', id));
+      // P1-7：与 socket mock.end 共用 finalizeSession（幂等，逻辑单一来源）
+      const dto = await finalizeSession(id, user.id);
+      if (!dto) throw new TRPCError('会话不存在', 'NOT_FOUND');
+      return dto;
     },
   },
 
@@ -264,8 +306,8 @@ export default {
       if (!report) {
         if (row.status !== 'COMPLETED') return { status: 'pending', sessionId: id };
         const ctx = buildContext(user.id, { resumeId: row.resume_id, goalId: row.goal_id });
-        report = await reportFor(row, all('SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC', id).map((m) => ({ role: m.role, content: m.content })), ctx);
-        run('UPDATE sessions SET report=? WHERE id=?', toJson(report), id);
+        // P1-11：走单飞生成，避免与 finalizeSession/并发请求重复调用模型
+        report = await generateReportOnce(id, row, ctx);
       }
       return report;
     },

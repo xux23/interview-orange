@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
-import { api, getToken, locale } from '../api/client';
+import { api, getToken, getSocketToken, locale } from '../api/client';
 import { Markdown, parseFollowups, cleanAnswerLabel } from '../lib/markdown.jsx';
 import { overlayWindow, publish } from '../lib/bridge';
 
@@ -20,16 +20,21 @@ export default function ExamRoom({ user }) {
   const [answer, setAnswer] = useState('');
   const [reqId, setReqId] = useState('');
   const [history, setHistory] = useState([]);
+  const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const socketRef = useRef(null);
   const streamRef = useRef(null);
+  const answerRef = useRef('');
+  const questionRef = useRef('');
+
+  useEffect(() => { questionRef.current = questionText; }, [questionText]);
 
   useEffect(() => {
     api.query('promptStudio.presets', { lang: locale() }).then((p) => setPresets(p.examPresets || [])).catch(() => {});
   }, []);
 
   useEffect(() => {
-    const socket = io('/desktop', { auth: { token: getToken(), locale: locale() }, transports: ['websocket', 'polling'] });
+    const socket = io('/desktop', { auth: { token: getToken(), socketToken: getSocketToken(), locale: locale() }, transports: ['websocket', 'polling'] });
     socketRef.current = socket;
     socket.on('connect', () => {
       socket.emit('exam.session.start', {
@@ -43,16 +48,38 @@ export default function ExamRoom({ user }) {
       });
     });
     socket.on('exam.peers', () => {});
-    socket.on('exam.start', ({ reqId: id }) => { setReqId(id); setStage('working'); setReasoning(''); setAnswer(''); publish({ type: 'overlay-exam', stage: 'start', reqId: id }); });
+    socket.on('exam.start', ({ reqId: id }) => {
+      answerRef.current = '';
+      setReqId(id);
+      setStage('working');
+      setReasoning('');
+      setAnswer('');
+      publish({ type: 'overlay-exam', stage: 'start', reqId: id });
+    });
     socket.on('exam.progress', ({ stage: s }) => setStage(s || 'working'));
     socket.on('exam.reasoning', ({ text }) => { setReasoning((r) => r + text); publish({ type: 'overlay-exam', stage: 'reasoning', text }); });
-    socket.on('exam.delta', ({ text }) => { setAnswer((a) => a + text); publish({ type: 'overlay-exam', stage: 'delta', text }); });
+    socket.on('exam.delta', ({ text }) => {
+      answerRef.current += text;
+      setAnswer((a) => a + text);
+      publish({ type: 'overlay-exam', stage: 'delta', text });
+    });
     socket.on('exam.end', () => {
       setStage('done');
+      setAnswer(answerRef.current);
       publish({ type: 'overlay-exam', stage: 'end' });
-      setHistory((h) => [...h, { questionText: questionText || '（截图题）', answer }]);
+      // socket 回调在 effect 建立时捕获闭包，必须从 ref 取本轮最终值
+      const q = questionRef.current.trim();
+      setHistory((h) => [...h, { questionText: q || '（截图题）', answer: answerRef.current }]);
     });
     socket.on('exam.quota', (q) => setQuota(q));
+    // 模型失败（文档 23 错误统一走 exam.error）：行内报错 + 浮窗提示，不再静默降级
+    socket.on('exam.error', ({ message } = {}) => {
+      const msg = message || '解题失败';
+      setStage('idle');
+      setError(msg);
+      flash(msg);
+      publish({ type: 'overlay-exam', stage: 'error', message: msg });
+    });
     socket.on('connect_error', (e) => console.warn('exam socket error', e.message));
     return () => { socket.removeAllListeners(); socket.disconnect(); streamRef.current?.getTracks?.().forEach((t) => t.stop()); };
   }, []); // eslint-disable-line
@@ -84,6 +111,9 @@ export default function ExamRoom({ user }) {
       streamRef.current = null;
       flash('已截取屏幕');
     } catch (e) {
+      // P2：失败分支同样释放屏幕流，避免摄像头/共享指示灯常亮
+      try { streamRef.current?.getTracks?.().forEach((t) => t.stop()); } catch { /* ignore */ }
+      streamRef.current = null;
       flash(`截屏失败：${e.message}（可改用粘贴截图）`);
     }
   };
@@ -109,8 +139,9 @@ export default function ExamRoom({ user }) {
   const solve = () => {
     if (!socketRef.current) return;
     if (!screenshot && !questionText.trim()) return flash('需要截图或题面');
+    setError('');
     const payload = {
-      screenshot, screenshots: screenshot ? [screenshot] : [], sessionId, mode,
+      screenshot, sessionId, mode,
       customization: { ...customization, preset, codeQuality: mode, lang: locale() },
       questionText,
       canCaptureWithCompatibility: true, canCaptureGpuChild: false, clientWindows: [],
@@ -135,7 +166,7 @@ export default function ExamRoom({ user }) {
   return (
     <div className="exam-shell">
       <aside className="exam-side">
-        <div className="row"><b>笔试房间</b><span className="spacer" /><span className={`pill ${quota?.isPro ? 'ok' : ''}`}>{quota ? `${quota.remainingMinutes} 分钟` : '…'}</span></div>
+        <div className="row"><b>笔试房间</b><span className="spacer" /><span className="tiny muted">无额度限制</span></div>
         <div className="field">
           <label>预设</label>
           <select value={preset} onChange={(e) => setPreset(e.target.value)}>
@@ -172,6 +203,11 @@ export default function ExamRoom({ user }) {
             <span className={`pill ${stage === 'working' ? '' : 'gray'}`}>{stage === 'working' ? '识别/作答中' : stage === 'done' ? '完成' : '待解题'}</span>
             <small className="muted">reqId：{reqId || '—'}</small>
           </div>
+          {error && (
+            <div className="card pad" style={{ borderColor: '#c0392b', color: '#c0392b', marginBottom: 10 }}>
+              ⚠ {error}
+            </div>
+          )}
           {reasoning && <div className="reasoning">{reasoning}</div>}
           {answer ? (
             <>
