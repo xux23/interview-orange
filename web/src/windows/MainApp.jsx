@@ -1245,7 +1245,18 @@ function StealthPage({ notice }) {
 /* ───────────── 设置 ───────────── */
 function SettingsPage({ user, notice, reloadUser }) {
   const [lang, setLang] = useState(locale());
-  const [style, setStyle] = useState(user.clientSettings?.overlayStyle || {});
+  const [style, setStyleState] = useState(user.clientSettings?.overlayStyle || {});
+  // 实时预览：设置页每次调整都经 bus 推给已打开的浮窗（原生壳跨 webview 已验证可用）；
+  // 保存仍走 user.updateClientSettings 持久化，两者不冲突。
+  const styleTimer = useRef(null);
+  const setStyle = (next) => {
+    setStyleState(next);
+    clearTimeout(styleTimer.current);
+    styleTimer.current = setTimeout(() => {
+      overlayWindow.push({ type: 'overlay-style', style: next });
+    }, 120);
+  };
+  useEffect(() => () => clearTimeout(styleTimer.current), []);
   // P1-4：默认与实际注册的 panic 热键一致（原生壳默认 Ctrl+Alt+Esc）
   const [panic, setPanic] = useState(user.clientSettings?.panicHotkey || 'Ctrl+Alt+Esc');
   const [busy, setBusy] = useState(false);

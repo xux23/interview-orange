@@ -65,6 +65,14 @@ export default function OverlayWindow({ user }) {
         // 新会话必须清掉上一场残留的卡片；同一会话重新显示时保留
         if (state.sessionId && state.sessionId !== prev) setCards([]);
         setGate({ ...state });
+        // 打开/预览时携带的样式立即应用（只取已知键，过滤 width/height 等非样式字段）
+        if (state.style && typeof state.style === 'object') {
+          const patch = {};
+          for (const k of Object.keys(DEFAULT_STYLE)) {
+            if (k in state.style) patch[k] = state.style[k];
+          }
+          if (Object.keys(patch).length) setStyle(patch);
+        }
         // P1-3：持久化会话标识——窗口隐藏/被关闭后经热键召回或重载，仍能接回原会话
         if (state.sessionId) {
           try { localStorage.setItem('overlay.session', JSON.stringify({ sessionId: state.sessionId, mode: state.mode })); } catch { /* ignore */ }
