@@ -44,7 +44,8 @@ export const config = {
   tokenTtlMs: 1000 * 60 * 60 * 24 * 7,
   // AI provider：mock（离线可用，默认）| openai（任意 OpenAI 兼容网关）
   ai: {
-    provider: env.ML_AI_PROVIDER || 'mock',
+    // 只填 Key 即切真实模型：未显式指定 provider 时按 Key 是否存在自动选择
+    provider: env.ML_AI_PROVIDER || (env.ML_AI_API_KEY ? 'openai' : 'mock'),
     baseUrl: env.ML_AI_BASE_URL || 'https://maas.qianwenaiapi.com/compatible-mode/v1',
     apiKey: env.ML_AI_API_KEY || '',
     model: env.ML_AI_MODEL || 'deepseek-v4.1-flash',
@@ -64,6 +65,8 @@ export const config = {
     silenceGateMs: num(env.ML_ASR_SILENCE_GATE_MS, 2000, 200, 6000),
     maxUtteranceMs: num(env.ML_ASR_MAX_UTTERANCE_MS, 30000, 1000, 120000),
   },
+  // 模型/网关内置：默认锁定（用户只填 Key）；ML_LOCK_MODELS=0 可解锁供开发调试
+  lockModels: env.ML_LOCK_MODELS !== '0',
   limits: {
     interviewRunPerMinute: 6,
     examRunPerMinute: 3,

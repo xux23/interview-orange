@@ -247,6 +247,8 @@ export function aiSnapshot() {
     source: Object.keys(saved).length ? 'settings' : 'env',
     savedKeys: Object.keys(saved),
     updatedAt: row('ai')?.updated_at || null,
+    modelsLocked: Boolean(config.lockModels),
+    builtin: { baseUrl: config.ai.baseUrl, model: config.ai.model, visionModel: config.ai.visionModel },
     envBaseline: {
       provider: aiBaseline.provider,
       baseUrl: aiBaseline.baseUrl,
@@ -258,8 +260,16 @@ export function aiSnapshot() {
 
 export function saveAI(patch = {}) {
   const clean = sanitizeAI(patch);
+  // 模型/网关锁定：忽略这三项覆盖（用户只填 Key）
+  if (config.lockModels) {
+    delete clean.baseUrl;
+    delete clean.model;
+    delete clean.visionModel;
+  }
   if (!Object.keys(clean).length) throw new Error('没有需要保存的字段');
   const merged = { ...savedAI(), ...clean };
+  // 只填 Key 的场景：未显式选择 mock 时自动切真实模型
+  if (clean.apiKey && merged.provider === 'mock' && patch.provider !== 'mock') merged.provider = 'openai';
   // 组合校验：切 openai 必须能拿到 key（本次传入或已有）
   const nextProvider = merged.provider ?? config.ai.provider;
   if (AI_PROVIDERS.includes(nextProvider) && nextProvider !== 'mock') {
@@ -284,6 +294,11 @@ export function resetAI() {
  */
 export async function probeAI(input = {}) {
   const clean = sanitizeAI(input);
+  if (config.lockModels) {
+    delete clean.baseUrl;
+    delete clean.model;
+    delete clean.visionModel;
+  }
   const cand = { ...config.ai, ...clean };
   const checks = [];
   if (cand.provider !== 'openai') {
@@ -401,6 +416,8 @@ export function asrSnapshot() {
     source: Object.keys(saved).length ? 'settings' : 'env',
     savedKeys: Object.keys(saved),
     updatedAt: row('asr')?.updated_at || null,
+    modelsLocked: Boolean(config.lockModels),
+    builtin: { baseUrl: config.asr.baseUrl, model: config.asr.model },
     envBaseline: {
       provider: asrBaseline.provider,
       baseUrl: asrBaseline.baseUrl,
@@ -411,8 +428,13 @@ export function asrSnapshot() {
 
 export function saveASR(patch = {}) {
   const clean = sanitizeASR(patch);
+  if (config.lockModels) {
+    delete clean.baseUrl;
+    delete clean.model;
+  }
   if (!Object.keys(clean).length) throw new Error('没有需要保存的字段');
   const merged = { ...savedASR(), ...clean };
+  if (clean.apiKey && merged.provider === 'mock' && patch.provider !== 'mock') merged.provider = 'qianwen';
   const nextProvider = merged.provider ?? config.asr.provider;
   if (nextProvider !== 'mock') {
     const key = has(merged, 'apiKey') ? merged.apiKey : config.asr.apiKey;
@@ -458,6 +480,10 @@ function wavFromPcm(pcm, sampleRate = 16_000) {
  */
 export async function probeASR(input = {}) {
   const clean = sanitizeASR(input);
+  if (config.lockModels) {
+    delete clean.baseUrl;
+    delete clean.model;
+  }
   const cand = { ...config.asr, ...clean };
   const checks = [];
   if ((cand.provider || 'qianwen') === 'mock') {

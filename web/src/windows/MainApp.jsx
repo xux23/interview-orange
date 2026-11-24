@@ -1575,6 +1575,12 @@ function SettingsPage({ user, notice, reloadUser }) {
         </small>
         {aiForm ? (
           <>
+            {aiInfo?.modelsLocked && (
+              <small className="muted" style={{ marginBottom: 8 }}>
+                网关与模型已内置：{aiInfo.builtin?.baseUrl} · {aiInfo.builtin?.model} / {aiInfo.builtin?.visionModel}。
+                只需粘贴 API Key 并保存即可；如需更换请编辑 .env（ML_LOCK_MODELS=0）。
+              </small>
+            )}
             <div className="row" style={{ alignItems: 'flex-end' }}>
               <div className="field" style={{ flex: 2 }}>
                 <label>provider</label>
@@ -1592,23 +1598,29 @@ function SettingsPage({ user, notice, reloadUser }) {
             <div className="field">
               <label>Base URL（含 /v1，末尾斜杠自动去掉）</label>
               <input value={aiForm.baseUrl} placeholder="https://api.openai.com/v1"
+                disabled={!!aiInfo?.modelsLocked}
                 onChange={(e) => setAiForm({ ...aiForm, baseUrl: e.target.value })} />
             </div>
             <div className="field">
               <label>API Key {aiInfo?.hasKey ? `（已保存 ${aiInfo.apiKeyMasked}，留空不修改）` : '（未配置）'}</label>
               <input type="password" autoComplete="off" value={aiForm.apiKey}
-                placeholder={aiInfo?.hasKey ? '留空保留原 Key' : 'sk-...'}
-                onChange={(e) => setAiForm({ ...aiForm, apiKey: e.target.value })} />
+                placeholder={aiInfo?.hasKey ? '留空保留原 Key' : '粘贴 Key 即启用真实模型'}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setAiForm((f) => ({ ...f, apiKey: v, ...(v.trim() && f.provider === 'mock' ? { provider: 'openai' } : {}) }));
+                }} />
             </div>
             <div className="grid2">
               <div className="field">
                 <label>文本模型（面试/笔试答题）</label>
                 <input value={aiForm.model} placeholder="deepseek-v4.1-flash"
+                  disabled={!!aiInfo?.modelsLocked}
                   onChange={(e) => setAiForm({ ...aiForm, model: e.target.value })} />
               </div>
               <div className="field">
                 <label>视觉模型（笔试截图题面）</label>
                 <input value={aiForm.visionModel} placeholder="qwen3.5-omni-flash"
+                  disabled={!!aiInfo?.modelsLocked}
                   onChange={(e) => setAiForm({ ...aiForm, visionModel: e.target.value })} />
               </div>
             </div>
@@ -1653,6 +1665,12 @@ function SettingsPage({ user, notice, reloadUser }) {
         </small>
         {asrForm ? (
           <>
+            {asrInfo?.modelsLocked && (
+              <small className="muted" style={{ marginBottom: 8 }}>
+                网关与模型已内置：{asrInfo.builtin?.baseUrl} · {asrInfo.builtin?.model}。
+                只需粘贴语音识别 Key 并保存；不填则使用本地替身。
+              </small>
+            )}
             <div className="row" style={{ alignItems: 'flex-end' }}>
               <div className="field" style={{ flex: 2 }}>
                 <label>provider</label>
@@ -1675,17 +1693,22 @@ function SettingsPage({ user, notice, reloadUser }) {
             <div className="field">
               <label>Base URL（含 /v1）</label>
               <input value={asrForm.baseUrl} placeholder="https://maas.qianwenaiapi.com/compatible-mode/v1"
+                disabled={!!asrInfo?.modelsLocked}
                 onChange={(e) => setAsrForm({ ...asrForm, baseUrl: e.target.value })} />
             </div>
             <div className="field">
               <label>API Key {asrInfo?.hasKey ? `（已保存 ${asrInfo.apiKeyMasked}，留空不修改）` : '（未配置）'}</label>
               <input type="password" autoComplete="off" value={asrForm.apiKey}
-                placeholder={asrInfo?.hasKey ? '留空保留原 Key' : 'sk-...'}
-                onChange={(e) => setAsrForm({ ...asrForm, apiKey: e.target.value })} />
+                placeholder={asrInfo?.hasKey ? '留空保留原 Key' : '粘贴 Key 即启用真实转写'}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setAsrForm((f) => ({ ...f, apiKey: v, ...(v.trim() && f.provider === 'mock' ? { provider: 'qianwen' } : {}) }));
+                }} />
             </div>
             <div className="field">
               <label>转写模型</label>
               <input value={asrForm.model} placeholder="qwen3.5-omni-flash"
+                disabled={!!asrInfo?.modelsLocked}
                 onChange={(e) => setAsrForm({ ...asrForm, model: e.target.value })} />
             </div>
             <div className="row">
