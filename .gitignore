@@ -33,3 +33,8 @@ Thumbs.db
 # ── 联调临时目录（不入库）──
 .tmp-hotkey/
 .tmp-review-data/
+
+# ── 运行期本地凭证（服务启动生成，绝不入库）──
+data/.api-token
+data/.keyring
+data/.socket-token
