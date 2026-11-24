@@ -79,8 +79,10 @@ export const overlayWindow = {
       // 原生壳：显示预建的 overlay 窗口；seq 一并发给 Rust，保证 sessionReady 对得上
       try { nat.showOverlay({ mode, sessionId, seq: this.seq }); } catch { /* ignore */ }
     } else {
-      const w = Number(style.width || (mode === 'exam' ? 440 : 400));
-      const h = Number(style.height || (mode === 'exam' ? 540 : 620));
+      // 浏览器模式：尺寸跟随样式（examWidth/interviewWidth 等；style.width 为旧键兼容）
+      const isExam = mode === 'exam';
+      const w = Number(isExam ? (style.examWidth ?? style.width) : (style.interviewWidth ?? style.width)) || (isExam ? 440 : 400);
+      const h = Number(isExam ? (style.examHeight ?? style.height) : (style.interviewHeight ?? style.height)) || (isExam ? 540 : 620);
       const features = `popup=1,width=${w},height=${h},left=${Math.max(0, screen.availWidth - w - 24)},top=60`;
       if (!this.handle || this.handle.closed) {
         this.handle = window.open(`${location.origin}${location.pathname}#overlay`, 'ml-overlay', features);
@@ -171,6 +173,10 @@ export function createOverlayGate({ onActivate, onHide, onSessionReady, onMode }
     onMode?.(mode);
     onActivate?.({ ...state, sessionId: sid, style: msg.style || null });
     if (mode === 'exam' || mode === 'interview') {
+      // 就绪握手同时回传原生壳（last_ready_seq），否则 releaseIfNotReady 永远判定未就绪
+      try {
+        window.orangeNative?.sessionReady?.(token);
+      } catch { /* 浏览器模式忽略 */ }
       publish({ type: 'overlay-session-ready', seq: token });
       onSessionReady?.({ seq: token, mode });
     }
@@ -194,7 +200,8 @@ export function createOverlayGate({ onActivate, onHide, onSessionReady, onMode }
       onMode?.(state.mode, msg.style);
     } else if (msg.type === 'overlay-exam') {
       onMode?.(state.mode, null, msg);
-    } else if (msg.type === 'overlay-ai') {
+    } else if (msg.type === 'overlay-ai' || msg.type === 'overlay-ai-text') {
+      // MockRoom 发的是 overlay-ai-text；此前只订阅 overlay-ai，注入框永远收不到题目
       onMode?.(state.mode, null, msg);
     }
   });

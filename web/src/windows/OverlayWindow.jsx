@@ -36,6 +36,7 @@ export default function OverlayWindow({ user }) {
   const sessionRef = useRef(null);
   const cardRef = useRef(null);
   const saveTimer = useRef(null);
+  const lastSizeRef = useRef(null);
 
   const styleRef = useRef(style);
   styleRef.current = style;
@@ -55,6 +56,35 @@ export default function OverlayWindow({ user }) {
   // 小项6：卸载时清理防抖定时器
   useEffect(() => () => clearTimeout(saveTimer.current), []);
 
+  /* 按样式里的尺寸调整原生浮窗（exam/interview 各自键，兼容旧 width/height）；
+   * 浏览器模式由 window.open 的 features 决定，这里只走原生。 */
+  function sizeOf(styleObj, mode) {
+    const isExam = mode === 'exam';
+    return {
+      w: Number(isExam ? (styleObj.examWidth ?? styleObj.width) : (styleObj.interviewWidth ?? styleObj.width)),
+      h: Number(isExam ? (styleObj.examHeight ?? styleObj.height) : (styleObj.interviewHeight ?? styleObj.height)),
+    };
+  }
+  function applyWindowSize(w, h) {
+    const nat = window.orangeNative;
+    if (!nat?.winRect || !nat?.winPosition) return;
+    if (!Number.isFinite(w) || w < 200 || !Number.isFinite(h) || h < 200) return;
+    nat.winRect('overlay')
+      .then((r) => r && nat.winPosition({ x: r.x, y: r.y, w: Math.round(w), h: Math.round(h) }))
+      .catch(() => {});
+  }
+
+  // 设置页实时推来的尺寸变化：仅当值真正变化且浮窗已激活时调整（首次只登记，保留用户拖动尺寸）
+  useEffect(() => {
+    const { w, h } = sizeOf(style, gate.mode === 'exam' ? 'exam' : 'interview');
+    if (!Number.isFinite(w) || w < 200 || !Number.isFinite(h) || h < 200) return;
+    const prev = lastSizeRef.current;
+    lastSizeRef.current = { w, h };
+    if (!prev || (prev.w === w && prev.h === h)) return;
+    if (!gate.active) return;
+    applyWindowSize(w, h);
+  }, [style.examWidth, style.examHeight, style.interviewWidth, style.interviewHeight, style.width, style.height, gate.active, gate.mode]);
+
   const flash = (msg) => { setToast(msg); setTimeout(() => setToast(''), 1400); };
 
   /* 门禁状态机：订阅主窗事件 + 兜底拉 seq */
@@ -68,10 +98,13 @@ export default function OverlayWindow({ user }) {
         // 打开/预览时携带的样式立即应用（只取已知键，过滤 width/height 等非样式字段）
         if (state.style && typeof state.style === 'object') {
           const patch = {};
-          for (const k of Object.keys(DEFAULT_STYLE)) {
+          for (const k of [...Object.keys(DEFAULT_STYLE), 'examWidth', 'examHeight', 'interviewWidth', 'interviewHeight']) {
             if (k in state.style) patch[k] = state.style[k];
           }
           if (Object.keys(patch).length) setStyle(patch);
+          // 打开/预览时按样式尺寸调整原生窗口（兼容旧 width/height 键）
+          const { w, h } = sizeOf(state.style, state.mode || 'interview');
+          applyWindowSize(w, h);
         }
         // P1-3：持久化会话标识——窗口隐藏/被关闭后经热键召回或重载，仍能接回原会话
         if (state.sessionId) {
@@ -393,7 +426,23 @@ export default function OverlayWindow({ user }) {
 
   useEffect(() => {
     const el = cardRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return undefined;
+    const to = el.scrollHeight - el.clientHeight;
+    const from = el.scrollTop;
+    const speed = Number(styleRef.current.scrollSpeed) || 1; // 0.05 ~ 3
+    if (to <= from) return undefined;
+    if (speed >= 3) { el.scrollTop = to; return undefined; }
+    // scrollSpeed 越大越快：基准 420ms，按倍率缩放（80ms ~ 1200ms）
+    const dur = Math.min(1200, Math.max(80, 420 / speed));
+    const t0 = performance.now();
+    let raf = 0;
+    const tick = (now) => {
+      const p = Math.min(1, (now - t0) / dur);
+      el.scrollTop = from + (to - from) * p;
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, [cards, streamView, exam.answer]);
 
   return (

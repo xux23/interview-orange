@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { api, refreshUser, locale, getSocketToken } from '../api/client';
 import { LOCALES, setLocale as saveLocale } from '../lib/i18n';
-import { overlayWindow, publish } from '../lib/bridge';
+import { overlayWindow, publish, subscribe } from '../lib/bridge';
 import { isNative, stealthState, setContentProtection, setSkipTaskbar, disguiseTitle, panicToggle } from '../lib/native';
 import { Markdown } from '../lib/markdown.jsx';
 import { startVoiceCapture } from '../lib/voice';
@@ -129,18 +129,26 @@ export default function MainApp({ user: initialUser }) {
         console.info('[crash-recovery] 没有进行中的面试会话，跳过浮窗恢复');
         return;
       }
-      const seq = await nat.showOverlay({ mode: 'interview' });
-      publish({ type: 'overlay-shown', seq, mode: 'interview', sessionId: active.id });
-      const onReady = async (ev) => {
-        const d = ev.detail || {};
-        if (d.event !== 'overlay-session-ready') return;
-        if ((d.payload?.seq ?? 0) >= (seq ?? 0)) {
+      // 原生 shim 的 showOverlay 返回 {seq}，不是裸数字（此前把对象当 seq，Number({})→NaN
+      // 导致就绪回传 seq=0、releaseIfNotReady 判定失效）
+      const shown = await nat.showOverlay({ mode: 'interview' });
+      const seq = Number(shown && typeof shown === 'object' ? shown.seq : shown) || 0;
+      const payload = { type: 'overlay-shown', seq, mode: 'interview', sessionId: active.id };
+      // 浮窗 webview 可能比主窗晚挂载（BroadcastChannel 不回放）：登记 lastShown 供其
+      // overlayShowSeqRequest 补发，并在 1.2s 后重发一次兜底（gate 对同一 show 幂等去重）
+      overlayWindow.lastShown = payload;
+      publish(payload);
+      setTimeout(() => { if (!done) publish(payload); }, 1200);
+      // 浮窗就绪信号走 BroadcastChannel（gate 发布 overlay-session-ready），
+      // 不是原生 window 事件——此前监听错通道，永远等不到就绪
+      const off = subscribe((msg) => {
+        if (msg.type !== 'overlay-session-ready') return;
+        if ((msg.seq ?? 0) >= (seq ?? 0)) {
           done = true;
-          window.removeEventListener('interview-orange', onReady);
+          off();
           console.info('[crash-recovery] 浮窗已恢复（未抢焦点）');
         }
-      };
-      window.addEventListener('interview-orange', onReady);
+      });
       setTimeout(async () => {
         if (done) return;
         const stillNotReady = await nat.releaseIfNotReady(seq).catch(() => true);
@@ -911,7 +919,6 @@ function MaterialPage({ notice }) {
     api.query('material.listOfficialLibraries').then(setLibs).catch(() => {});
   };
   useEffect(load, []);
-  useEffect(() => { if (active) api.query('material.getMaterial', { root: active }).then(setActive); }, []); // eslint-disable-line
 
   const open = async (id) => setActive(await api.query('material.getMaterial', { root: id }).catch((e) => { notice(e.message); return null; }));
 
@@ -1145,6 +1152,7 @@ function StealthPage({ notice }) {
             contentProtection: { ...(s?.contentProtection || {}), [kind]: applied },
           }));
         }
+        if (r.ok === false) notice('防截屏未能生效（系统/显卡不支持，或窗口尚未就绪）');
       } else {
         notice('防截屏需要桌面端（双击 启动.bat 用 Rust 原生壳）');
       }

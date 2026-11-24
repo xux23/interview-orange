@@ -79,10 +79,8 @@ export default function MockRoom({ user }) {
     socket.on('ai.message', (chunk) => setDraftAnswer((a) => a + chunk));
     socket.on('ai.messageEnd', () => {
       setDraftAnswer((a) => {
-        if (a) {
-          setItems((list) => [...list, { role: 'ASSISTANT', content: a }]);
-          publish({ type: 'overlay-ai-text', text: a });
-        }
+        // 只把「面试官问题」推给浮窗注入框；AI 答案不覆盖输入框（浮窗自己已收流式答案）
+        if (a) setItems((list) => [...list, { role: 'ASSISTANT', content: a }]);
         return '';
       });
     });

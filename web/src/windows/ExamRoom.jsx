@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import { api, getToken, getSocketToken, locale } from '../api/client';
 import { Markdown, parseFollowups, cleanAnswerLabel } from '../lib/markdown.jsx';
-import { overlayWindow, publish } from '../lib/bridge';
+import { overlayWindow, publish, subscribe } from '../lib/bridge';
 
 export default function ExamRoom({ user }) {
   const params = useMemo(() => new URLSearchParams(location.hash.split('?')[1] || ''), []);
@@ -26,6 +26,8 @@ export default function ExamRoom({ user }) {
   const streamRef = useRef(null);
   const answerRef = useRef('');
   const questionRef = useRef('');
+  const reqIdRef = useRef('');
+  useEffect(() => { reqIdRef.current = reqId; }, [reqId]);
 
   useEffect(() => { questionRef.current = questionText; }, [questionText]);
 
@@ -83,6 +85,15 @@ export default function ExamRoom({ user }) {
     socket.on('connect_error', (e) => console.warn('exam socket error', e.message));
     return () => { socket.removeAllListeners(); socket.disconnect(); streamRef.current?.getTracks?.().forEach((t) => t.stop()); };
   }, []); // eslint-disable-line
+
+  // 浮窗里的追问按钮经总线发来 → 在房间侧发起 exam.followUp（此前无人接收，点了没反应）
+  useEffect(() => {
+    const off = subscribe((msg) => {
+      if (msg.type !== 'overlay-followup' || !msg.text) return;
+      socketRef.current?.emit('exam.followUp', { reqId: reqIdRef.current, intent: 'message', message: String(msg.text) }, () => {});
+    });
+    return off;
+  }, []);
 
   useEffect(() => {
     // 打开笔试浮窗（mode=exam）
