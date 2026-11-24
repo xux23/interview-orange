@@ -1128,12 +1128,26 @@ function StealthPage({ notice }) {
   };
 
   const toggleProtection = async (kind) => {
+    if (busy) return;
     setBusy(true);
     try {
       const cur = state?.contentProtection?.[kind] ?? false;
       const r = await setContentProtection(kind, !cur);
-      if (r) setState((s) => ({ ...(s || {}), contentProtection: r }));
-      else notice('防截屏需要桌面端（双击 启动.bat 用 Rust 原生壳）');
+      if (r) {
+        // 原生壳返回完整映射时直接用；旧版只回 {ok,kind,enable} 时按本次参数更新该键，
+        // 绝不把返回值整体当成 contentProtection 写入（那会让勾选框立刻回退）
+        if (r.contentProtection && typeof r.contentProtection === 'object') {
+          setState((s) => ({ ...(s || {}), contentProtection: r.contentProtection }));
+        } else {
+          const applied = typeof r.enable === 'boolean' ? r.enable : !cur;
+          setState((s) => ({
+            ...(s || {}),
+            contentProtection: { ...(s?.contentProtection || {}), [kind]: applied },
+          }));
+        }
+      } else {
+        notice('防截屏需要桌面端（双击 启动.bat 用 Rust 原生壳）');
+      }
     } finally { setBusy(false); }
   };
 

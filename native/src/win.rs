@@ -1046,7 +1046,10 @@ pub fn handle_ipc(
             let kind = args.get("kind").and_then(|x| x.as_str()).unwrap_or("main");
             let enable = args.get("enable").and_then(|x| x.as_bool()).unwrap_or(true);
             let ok = set_wda(state, kind, enable);
-            Some((id, true, json!({ "ok": ok, "kind": kind, "enable": enable })))
+            // 返回应用后的完整映射，前端可直接用它刷新两个勾选框（此前只回 {ok,kind,enable}，
+            // 前端误当成 contentProtection 整表，导致点完立刻回退、切页才恢复）
+            let map = state.lock().unwrap_or_else(|e| e.into_inner()).wda.clone();
+            Some((id, true, json!({ "ok": ok, "kind": kind, "enable": enable, "contentProtection": map })))
         }
         "stealth.panic" => {
             panic_toggle(state);
