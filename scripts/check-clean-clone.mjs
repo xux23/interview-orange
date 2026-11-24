@@ -22,8 +22,8 @@ const check = (ok, name, extra = '') => {
   console.log(`[${ok ? 'PASS' : 'FAIL'}] ${name}${extra ? ' — ' + extra : ''}`);
 };
 
-function run(cmd, args, cwd) {
-  return execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: process.platform === 'win32' });
+function run(cmd, args, cwd, { shell = process.platform === 'win32' } = {}) {
+  return execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell });
 }
 
 try {
@@ -66,7 +66,7 @@ try {
   let syntaxErrors = 0;
   for (const f of serverFiles) {
     try {
-      run(process.execPath, ['--check', f], cloneDir);
+      run(process.execPath, ['--check', f], cloneDir, { shell: false });
     } catch (e) {
       syntaxErrors += 1;
       console.log('   语法错误:', f, String(e.stderr || e.message).slice(0, 200));

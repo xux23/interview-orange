@@ -49,7 +49,7 @@ export async function finalizeSession(sessionId, userId) {
   try {
     const ctx = buildContext(userId, { resumeId: row.resume_id, goalId: row.goal_id, materialIds: fromJson(row.metadata, {})?.materialIds });
     // P1-11：与 getSessionReport 共用单飞生成（同一会话只跑一次模型）
-    await generateReportOnce(sessionId, row, ctx, { withMeta: true });
+    const report = await generateReportOnce(sessionId, row, ctx, { withMeta: true });
     const now = nowIso();
     const realDuration = Math.max(1, Math.round((Date.now() - Date.parse(row.created_at)) / 1000));
     run('UPDATE sessions SET status=?, updated_at=?, completed_at=?, real_duration=?, report=? WHERE id=?',
