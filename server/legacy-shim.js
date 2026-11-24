@@ -219,8 +219,13 @@
     cmd_get_cursor_pos: function () { return null; },
     cmd_set_cursor_point_feed: function () { return null; },
 
-    /* 采集（浏览器内用 getDisplayMedia / getUserMedia，原生采集不可用） */
-    cmd_capture_screen: function () { return null; },
+    /* 采集：原生壳内委托 GDI 截屏；纯浏览器保持不可用 */
+    cmd_capture_screen: function (a) {
+      if (window.orangeNative && window.orangeNative.captureScreen) {
+        return window.orangeNative.captureScreen({ maxWidth: (a && a.maxWidth) || 0 });
+      }
+      return null;
+    },
     cmd_capture_displays: function () { return []; },
     cmd_check_screen_capture_permission: function () { return { granted: true, canAsk: true }; },
     cmd_request_screen_capture_permission: function () { return { granted: true }; },

@@ -13,7 +13,7 @@
 ```
 面试橙/
 ├── server/             Node（零原生依赖）：node:http + express + node:sqlite + Socket.IO
-│   ├── trpc/           tRPC v11 兼容层（92 个过程；单请求 + 批量 JSONL 惰性流双协议）
+│   ├── trpc/           tRPC v11 兼容层（101 个过程；单请求 + 批量 JSONL 惰性流双协议）
 │   ├── ai/             官方提示词加载、systemPrompt 组装、mock/OpenAI 双 provider
 │   ├── socket.js       root（面试）/desktop（笔试）双 namespace，逐字流式
 │   ├── legacy-shim.js  原版前端挂载桩（54 cmd_* + 事件/store/OS 插件 + 网络重定向）
@@ -22,7 +22,7 @@
 ├── web/                自研 UI（React 18 + Vite，hash 分身四窗口）
 ├── public/             构建产物（npm run build 生成）
 ├── data/               app.db（SQLite）+ prompts（13 语言官方 presets）+ screenshots + uploads
-├── scripts/            smoke.mjs（端到端冒烟）、socket-events.mjs（44 事件矩阵+真实转写）、asr-separation.mjs（双路说话人分离）、real-ai-e2e.mjs（真模型全链路）、legacy-shot.mjs、cdp-*.mjs
+├── scripts/            smoke.mjs（端到端冒烟）、socket-events.mjs（43 事件矩阵+真实转写）、asr-separation.mjs（双路说话人分离）、real-ai-e2e.mjs（真模型全链路）、ai-config-e2e.mjs / asr-config-e2e.mjs（配置中心热切换）、legacy-shot.mjs、cdp-*.mjs
 ├── native/             Rust 原生壳（唯一桌面路线：tao+wry，WDA/panic/伪装/WASAPI/焦点钩子）
 ├── 启动.bat / 启动.ps1  便携启动器（双击 = 服务 + Rust 原生壳）
 └── shell/              浏览器降级方案（Edge --app + Win32 置顶）
@@ -36,15 +36,15 @@ npm install            # 独立 node_modules，不污染全局
 npm run build          # 构建自研前端到 ./public
 node server/index.js   # 首次启动自动建表 + seed
 # 打开 http://127.0.0.1:8756          → 自研 UI
-#     http://127.0.0.1:8756/legacy/   → 原版前端挂载（自动登录演示账号）
+#     http://127.0.0.1:8756/legacy/   → 原版前端挂载（桩兼容 token）
 
 # 或直接双击 启动.bat（= 自动起服务 + Rust 原生壳：原生浮窗/热键/防截屏/伪装）
 #     命令行等价：powershell -ExecutionPolicy Bypass -File 启动.ps1
 #     重新编译壳：.\启动.ps1 -Build    WDA 自检：.\启动.ps1 -SelfTest 1
 ```
 
-- 演示账号：`13800000000` / `demo1234`（自研 UI 启动时走 `user.getTempToken → loginByTempToken` 自动登录；`/legacy` 由桩同步预取）
-- 端口、数据目录、AI provider 都可在 `.env` 覆盖（见 `.env.example`）
+- **账号模块已移除（2026-11-23）**：无登录/订阅/充值/额度——本地单用户直接用；`user.getTempToken` / `loginByTempToken` 降级为兼容桩（固定哑 token），`/legacy` 原版前端与既有测试脚本零改动继续工作
+- 端口、数据目录、AI provider 都可在 `.env` 覆盖（见 `.env.example`）；AI 接入另可在**设置页运行时覆盖**（写 `data/app.db`，热切换、无需重启）
 - 端到端自检：`node scripts/smoke.mjs`（当前 17 项全 PASS）
 
 ## 原版前端挂载（/legacy）——文档 8.5「浏览器桩」的服务端重实现
@@ -103,23 +103,23 @@ node server/index.js   # 首次启动自动建表 + seed
 | 笔试截图解题（reasoning/delta/end/quota，扣 2 分钟） | 08 | `socket.js` + `ExamRoom.jsx` |
 | DB Schema（AiSession 全字段 + 关联模型） | 09 | `db.js`（node:sqlite） |
 | 官方提示词 13 语言 / 4 面试风格 / 4 笔试风格 / 24 预设 | 10 | `data/prompts/*.json`（原样拷贝） |
-| 面试答题 systemPrompt 七节组装（简历注入 + 知识库 + 风格） | 20 | `ai/prompts.js` |
+| 面试答题 systemPrompt **官方拼装**（基础段 + 语言与转写 + 我的资料 + 风格前半 + 每一轮规则；自定义提示词路径同官方；zh/en 与线上官方逐字一致，仅首尾空行差异） | 20 + chain/online-interview | `ai/prompts.js` |
 | 知识库注入（`【知识库：…】` / full-retrieval 双档） | 20 | `ai/prompts.js#buildKnowledge` |
 | promptStudio 三过程 + 限流（run 6/min、assist 3/min） | 20/22 | `trpc/misc.js` |
 | exam 24 预设策略（coding/choice/fill/ai_coding/psych…） | 22 | `ai/prompts.js` + `ai/mockBrain.js` |
 | 客户端配置（localStorage + store.json 等价物 + 导入导出） | 06 | `SettingsPage` |
 | **隐蔽与防检测**：WDA 防截屏 / panic 全窗隐藏 / 窗口+进程伪装 / 任务栏隐藏 | 05/15/24 | `native/src/win.rs` + 设置页 StealthPanel（实机验证） |
 | 题库 / 押题 / 资料 / 官方资料库 / 求职进度 / 评分反馈 | 07/16/17 | `trpc/bank.js`、`resource.js` |
-| Socket 全事件矩阵（44/44，含 ai.webSearch/prewarm/interrupt/mergePrev/onMsg/turnKind、stt.data/pending/changed/turnEnd/speaker、audio.requestPermission、exam.session/error、perf.ping） | 08/23 | `server/socket.js` + `scripts/socket-events.mjs`（44/44 PASS） |
+| Socket 全事件矩阵（43 项；ai.webSearch 假触发已移除，ai.interrupt 为真打断；prewarm/mergePrev/onMsg/turnKind、stt.data/pending/changed/turnEnd/speaker、audio.requestPermission、exam.session/error、perf.ping） | 08/23 | `server/socket.js` + `scripts/socket-events.mjs`（mock 43/43 PASS） |
 | 转写落库（InterviewTranscript） | 09 | `trpc/session.js#insertTranscript`（实测 transcripts 表有行） |
-| **真实语音识别（STT）**：能量 VAD 切句 → 整句转写 → 官方事件序列 | 23 | `server/ai/asr.js`（qwen3.8-omni-flash，实测中/英全对、~1.2s/句）+ `socket.js` VAD 管线 + `web/src/lib/voice.js` 采集（麦克风/共享音频） |
+| **真实语音识别（STT）**：能量 VAD 切句 → 整句转写 → 官方事件序列 | 23 | `server/ai/asr.js`（qwen3.5-omni-flash，实测中/英全对、~0.7s/句）+ `socket.js` VAD 管线 + `web/src/lib/voice.js` 采集（麦克风/共享音频） |
 | 复盘报告 schema（status + fiveDimensions×5 + strengths/shortcomings×3 + suggestions×5 + relatedKnowledge×13 + conversationAnalysis） | 23 §9.2 | `ai/mockBrain.js#buildReport`（新建会话实测逐段/五维/知识点全对） |
 | 报告导出 Markdown（DH 等价） | 23 §9.2 | `MainApp.jsx#exportReportMarkdown` |
-| 公告 5min 轮询 / 使用须知 5s 倒计时 / 收银台 `/pay/mock` / refreshToken 1h 轮询 | 06 §5 | `MainApp.jsx`、`server/index.js`、`api/client.js`（接口+页面均已验证） |
+| 公告 5min 轮询 / 使用须知 5s 倒计时（收银台与 refreshToken 轮询已随账号模块移除） | 06 §5 | `MainApp.jsx`、`server/index.js` |
 | 浮窗 zones（350ms + JSON diff）、Alt+方向键移动、auto-palette（capture→suggestPalette→undo） | 03 §4/§5 | `OverlayWindow.jsx`（CDP 实测 zones=[body]，autoPalette 存在） |
 | 押题流式订阅（prediction.item×N → end） | 17 | `socket.js` + 题库页（实测 12 条流式 PASS） |
 | **押题生成 `questionPrediction.generate`**（简历+JD+题库检索 → 题目与解析） | 19 | `ai/enrich.js#generatePredictionItems` + `trpc/bank.js`（实测 6 题全模型，`source=model`） |
-| **视觉配色 `overlay.suggestPalette`**（读壁纸出同色系底色+可读前景） | 21 §2.6 | `ai/enrich.js#generatePalette`（BMP→缩略 PNG 免依赖转码 + `qwen3.8-omni-flash`，实测 `source=vision`） |
+| **视觉配色 `overlay.suggestPalette`**（读壁纸出同色系底色+可读前景） | 21 §2.6 | `ai/enrich.js#generatePalette`（BMP→缩略 PNG 免依赖转码 + `config.ai.visionModel`，实测 `source=vision`） |
 | **`tools.stt.stt` 真转写**（audioBase64 / http(s) audioUrl → 文本） | 04/07 | `ai/enrich.js#transcribeAudio`（复用千问 ASR，实测逐字正确） |
 | **热词抽取**（JD+简历 → 20 术语 + 4 类目） | 21 §2.4 | `ai/enrich.js#extractHotWords`（实测 `source=model`，20 术语） |
 | **岗位推荐**（简历 → 3 个匹配岗位） | 19 | `ai/enrich.js#suggestGoalsFromResume`（实测 3 条模型推荐） |
@@ -136,8 +136,10 @@ node server/index.js   # 首次启动自动建表 + seed
 
 - **远程 IPC 放行**（Tauri v2 对外部 http 域默认禁 IPC）：`capabilities/default.json` 声明
   `remote.urls`（http://127.0.0.1:*）+ `permissions/default.toml` 放行 `ipc` 命令
-- **构建链自包含**：rust-lld 链接；windres 需要的 `gcc -E` 由项目内
-  `.tools/bin/gcc.exe`（直通 shim，兼把 ICON 路径改写到 ASCII junction）提供
+- **构建链自包含**：rust-lld 链接；windres/gcc 不认中文路径，由项目内 `.tools/bin/` 的改写 shim
+  解决——`windres`（含 `x86_64-w64-mingw32-windres` 同名）shim 把 resource.rc 里烙有的
+  CARGO_MANIFEST_DIR 真实路径改写成 ASCII junction 后转调真工具（`native/tools/*-shim.c`，
+  由 `native/toolchain.ps1` 自动编译）；`gcc` shim 同理改写参数与 `-E` 输出
 - WebView2 用户数据目录放项目内 `data/webview`（默认 %LOCALAPPDATA% 在受限环境拒绝访问）
 
 ```powershell
@@ -171,9 +173,15 @@ powershell -ExecutionPolicy Bypass -File native\run.ps1 -SelfTest 3   # IPC 探�
 
 **隔离与还原**（满足「不污染系统」）：
 
-- Rust 工具链、crates 缓存、构建产物全在 `.tools/`；链接用 **rust-lld 自包含**，不需要 gcc/MSVC
-- 仅有一个 ASCII junction `D:\ml-build → <项目>\.tools\target`（`dlltool` 不支持中文路径，物理文件仍在项目内）
-- 一键还原：`powershell -File .tools\restore.ps1`（`-Full` 连工具链一起删）
+- Rust 工具链、crates 缓存、构建产物全在 `.tools/`；链接用 **rust-lld 自包含**，不需要 MSVC
+- 构建路径动态解析（`native/run.ps1`）：项目路径为纯 ASCII 时直接用真实路径（零外部痕迹）；
+  含中文路径时在**任一可用盘符根**自动创建/复用 ASCII junction `<盘符>:\ml-src → <项目根>`
+  （`dlltool`/`lld`/`windres` 不认中文路径；产物目录与 TEMP 都经 junction 变 ASCII，
+  物理文件仍在项目内，卸载时删除该 junction 即可）
+- > **当前状态（2026-11-23 便携化检查后重建）**：`.tools/` 已按 `native/toolchain.ps1` 重建
+  > （rustup stable-gnu 1.100 + mingw64 16.2 + windres/gcc 改写 shim），原生壳 exe 已构建并通过
+  > WDA SelfTest。若日后再被清除，跑 `powershell -File native\toolchain.ps1` 一条命令即可恢复
+  > （rustup 走 rsproxy.cn 镜像、mingw64 走 ghfast.top 中转，国内可达）。
 
 隐蔽能力全部在 `native/`（Rust）实现并实机验证（见上表）：WDA 防截屏（浮窗启动即开）、
 `Ctrl+Alt+Esc` panic 全窗隐藏、窗口伪装 + **进程级 PE 伪装**（改名/版本信息/图标）、
@@ -188,22 +196,47 @@ powershell -ExecutionPolicy Bypass -File native\run.ps1 -SelfTest 3   # IPC 探�
 
 ## AI provider
 
+> **超时与打断（2026-11-23 优化）**：所有上游调用带 AbortController 超时——非流式总超时 120s（`ML_AI_TOTAL_TIMEOUT_MS`）、
+> 流式首字 30s（`ML_AI_FIRST_TOKEN_MS`）+ 空转 60s（`ML_AI_IDLE_TIMEOUT_MS`）、ASR 60s（`ML_ASR_TIMEOUT_MS`），超时即报错不挂起；
+> `ai.interrupt` / `exam.abort` 为**真打断**（AbortSignal 贯穿生成管线，已吐出的增量保留）。流式转发为事件驱动队列（零轮询延迟）。
+
+
 默认 `mock`：不联网、确定性，按官方输出协议产出「**核心要点** + **参考回答**」与「**答案：** + `[[FOLLOWUP: …]]`」，
-用于本地开发与冒烟。本仓库 `.env` 已配置**真实模型**（千问 MaaS，OpenAI 兼容）：
+用于本地开发与冒烟。本仓库 `.env` 已配置**真实模型**（MaaS 网关，OpenAI 兼容，千问 + DeepSeek 混合选型）：
 
 ```ini
 ML_AI_PROVIDER=openai
 ML_AI_BASE_URL=https://maas.qianwenaiapi.com/compatible-mode/v1   # 任意 OpenAI 兼容网关
 ML_AI_API_KEY=sk-...
-ML_AI_MODEL=qwen3.8-flash             # 出题/面试答案/笔试文本解题/提示词改写/LLM 报告评分
-ML_AI_VISION_MODEL=qwen3.8-omni-flash  # 笔试截图识别题面（视觉）
+ML_AI_MODEL=deepseek-v4.1-flash        # 出题/面试答案/笔试文本解题/提示词改写/LLM 报告评分（flash 档，实测最快且答案最具体）
+ML_AI_VISION_MODEL=qwen3.5-omni-flash  # 笔试截图识别题面（视觉，2026-11-24 复测：读题/解题延迟约为 3.8-omni 的 1/3，准确率持平）
+ML_ASR_MODEL=qwen3.5-omni-flash        # 语音转写（2026-11-24 复测：~0.7s/句，比 3.8-omni 快约 200ms，逐字全对）
 ```
 
-真实模式覆盖（`scripts/real-ai-e2e.mjs` 9/9 实测）：模拟面试官**真实出题**（带已问列表防重复）→
+真实模式覆盖（`scripts/real-ai-e2e.mjs` 实测）：模拟面试官**真实出题**（带已问列表防重复）→
 **真实辅助答案**（官方 5344 字 systemPrompt + 双段协议，TTFT ~1.1s）→ 笔试**截图视觉解题**
-（OCR 认题 + 作答；截图 <16px 或视觉失败自动降级文本/mock，上游故障不崩服务）→
-promptStudio **真改写** → **LLM rubric 复盘报告**（五维/逐段/建议，解析失败回退本地规则）。
-改回 `ML_AI_PROVIDER=mock` 即恢复纯离线模式，接口与页面均不变（`healthz.provider` 可查）。
+（OCR 认题 + 作答）→ promptStudio **真改写** → **LLM rubric 复盘报告**（五维/逐段/建议）。
+**模型失败一律直接报错，不做静默降级**：面试出题/答题失败推送 `ai.error` 事件（房间与浮窗均显示错误卡片）、
+笔试解题失败推送 `exam.error`（不扣时长、不记录）、tRPC 过程（押题/热词/岗位推荐/问答对/配色/STT/报告）失败返回错误信息；
+`mock` provider 下的本地实现是离线模式的主路径，不受影响。改回 `ML_AI_PROVIDER=mock` 即恢复纯离线模式，
+接口与页面均不变（`healthz.provider` 可查）。
+
+### 运行时配置中心（不重启热切换）
+
+`.env` 只在启动时读一次；实际接入参数可在 **设置 → AI 接入 / 语音识别** 里改，写进 `data/app.db` 的
+`app_settings` 表（`key = 'ai' | 'asr'` 两个独立 section）并**立即生效**
+（`provider.js` / `pipeline.js` / `asr.js` / `socket.js` 每次调用都读活的 `config.ai` / `config.asr`）：
+
+| 能力 | 入口 | 说明 |
+|---|---|---|
+| 读当前配置 | `settings.ai.get` / `settings.asr.get` | 只回 `hasKey` + 掩码 `apiKeyMasked`，明文 key 不出服务端 |
+| 保存热切换 | `settings.ai.set` / `settings.asr.set` | 字段级校验（AI：provider/baseUrl/model/visionModel/temperature；ASR：provider/baseUrl/model/silenceGateMs/maxUtteranceMs）；key 留空=保留原值，`clearApiKey` 显式清除 |
+| 连通性自检 | `settings.ai.probe` / `settings.asr.probe` | AI：先 `GET /models`（best-effort）再真发一次 1-token `POST /chat/completions`；ASR：真发一段 0.4s 静音 WAV 走 `input_audio` 通道（验 key 权限、网关是否支持音频块、模型名）；都返回逐项 `checks` + 延迟，**不落库、不改生效配置**，可「先测后存」 |
+| 回退基线 | `settings.ai.reset` / `settings.asr.reset` | 删掉 DB 覆盖，回到 `.env` / 出厂默认 |
+
+优先级：设置页覆盖 > `.env` > 出厂默认；`/healthz` 用 `providerSource` / `asrSource`（`settings` / `env`）标明来源。
+自检专项：`npm run test:ai`（`scripts/ai-config-e2e.mjs` 15/15）+ `npm run test:asr`
+（`scripts/asr-config-e2e.mjs` 15/15：假音频网关、input_audio 真转写、热切换、越界校验、回退替身）。
 
 ## 独立环境的含义
 
@@ -215,20 +248,25 @@ promptStudio **真改写** → **LLM rubric 复盘报告**（五维/逐段/建�
 
 ## 已知边界（与文档对齐）
 
-1. **OCR 已真**：笔试解题用 `qwen3.8-omni-flash` 读截图认题（<16px 或视觉失败自动降级文本/mock）。
+1. **OCR 已真**：笔试解题用 `qwen3.5-omni-flash` 读截图认题；截图无效且无题面文本、或模型失败时直接报 `exam.error`（不降级、不扣费）。
    **TTS 仍为本地替身**（1 秒正弦 WAV——网关无 TTS 模型）。
    **STT 已真实**：`.env` 配 `ML_ASR_API_KEY` 后，`stt.data` 音频帧走能量 VAD 切句 +
-   `qwen3.8-omni-flash` 整句转写（实测中/英文全对，~1.2s/句；`healthz.asr` 可查状态）；
+   `qwen3.5-omni-flash` 整句转写（实测中/英文全对，~0.7s/句；`healthz.asr` 可查状态）；
    `tools.stt.stt` 同样真转写（audioBase64 / audioUrl）；未配置 key 时两处都回退替身。
 2. 模拟面试房间「🎤 语音作答」= 麦克风→转写→自动作答（说完停顿 ~2s 提交）；
    真实面试页可开「🎙 面试官声音（共享音频）」自动识别提问并流答案到浮窗，「🎤 我的回答」记录本人发言；
    浏览器共享音频需在弹窗中勾选「标签页/系统声音」；
 3. 浏览器下浮窗是普通窗口、无任何隐蔽能力；桌面一律用 Rust 原生壳（`启动.bat`）；
-4. **报告评分**：`openai` 模式为 LLM rubric（五维/逐段/建议全模型生成，JSON 失败自动回退本地规则）；
-   `mock` 模式为本地 rubric。**TTS 仍为本地替身**（1 秒 WAV——网关无 TTS 模型）。
+4. **报告评分**：`openai` 模式为 LLM rubric（五维/逐段/建议全模型生成；生成失败直接报错，会话保持可重试）；`mock` 模式为本地 rubric。**TTS 仍为本地替身**（1 秒 WAV——网关无 TTS 模型）。
 
 5. **Rust 原生壳的边界**：PE 伪装已重写版本信息**并替换图标资源**；
    overlay 启动即显示（原版是先建后隐）；hotpatch 实际切换（本地只做版本握手与 reload）、net:53 中继、46 项开关的**服务端下发**未接（本地为静态表）。
-6. **`.tools` 体积约 2.3 GB**（Rust 工具链 + crates + 构建产物）；不想要时 `restore.ps1 -Full` 一次性清除。
+6. **`.tools` 重建**（曾被 `restore -Full` 清除，2026-11-23 已按 `native/toolchain.ps1` 重建并构建出 exe）：
+   再被清除时跑 `native/toolchain.ps1` + `run.ps1 -Build` 即可恢复；构建路径自动解析（含中文路径时经
+   `<盘符>:\ml-src` junction），不再依赖手工创建的 `D:\ml-build`。原生壳服务地址跟随 `ML_PORT`
+   （优先级 `-Port` > 环境变量 > `.env` > 默认 8756，与启动器同口径）。
+7. **热切换对「已建立的语音连接」不回溯**：`settings.asr.*` 保存后，`config.asr` 立即生效，
+   但静音门限 / 单句上限在 `stt.start` 时快照进连接状态，正在进行的会话要重新 `stt.start`（或重连）才用新值；
+   文本/视觉模型（`settings.ai.*`）则是每次调用都读活对象，无此限制。
 
 细节见 `ARCHITECTURE.md`，运行与排错见 `RUN.md`。

@@ -8,6 +8,7 @@ import { TRPCError } from './errors.js';
 import { interviewRun, promptAssist } from '../ai/pipeline.js';
 import { generatePalette, transcribeAudio } from '../ai/enrich.js';
 import { loadPresets, LANGS } from '../ai/prompts.js';
+import { aiSnapshot, probeAI, resetAI, saveAI, asrSnapshot, probeASR, resetASR, saveASR } from '../settings.js';
 
 const pass = z.object({}).passthrough();
 
@@ -43,6 +44,106 @@ function presetsPayload(lang = 'zh-CN') {
 }
 
 export default {
+  /** ───── AI 接入运行时配置（设置页热切换；优先于 .env）───── */
+  'settings.ai.get': {
+    kind: 'query', input: pass.optional(),
+    handler: () => ({ ...aiSnapshot(), limits: config.limits }),
+  },
+
+  'settings.ai.set': {
+    kind: 'mutation',
+    input: z.object({
+      provider: z.enum(['mock', 'openai']).optional(),
+      baseUrl: z.string().optional(),
+      apiKey: z.string().optional(),
+      clearApiKey: z.boolean().optional(),
+      model: z.string().optional(),
+      visionModel: z.string().optional(),
+      temperature: z.number().min(0).max(2).optional(),
+    }).passthrough(),
+    handler: (input) => {
+      try {
+        return saveAI(input);
+      } catch (e) {
+        throw new TRPCError(e.message, 'BAD_REQUEST');
+      }
+    },
+  },
+
+  'settings.ai.probe': {
+    kind: 'mutation',
+    input: z.object({
+      provider: z.enum(['mock', 'openai']).optional(),
+      baseUrl: z.string().optional(),
+      apiKey: z.string().optional(),
+      model: z.string().optional(),
+      visionModel: z.string().optional(),
+      temperature: z.number().min(0).max(2).optional(),
+    }).passthrough().optional(),
+    handler: async (input = {}, { user }) => {
+      if (!rateLimit(`probe:${user.id}`, 8)) throw new TRPCError('连通性自检每分钟最多 8 次', 'TOO_MANY_REQUESTS');
+      try {
+        return await probeAI(input);
+      } catch (e) {
+        throw new TRPCError(`自检失败：${e.message}`, 'BAD_REQUEST');
+      }
+    },
+  },
+
+  'settings.ai.reset': {
+    kind: 'mutation', input: pass.optional(),
+    handler: () => resetAI(),
+  },
+
+  /** ───── ASR 语音识别运行时配置（同一套覆盖机制，独立 section）───── */
+  'settings.asr.get': {
+    kind: 'query', input: pass.optional(),
+    handler: () => ({ ...asrSnapshot() }),
+  },
+
+  'settings.asr.set': {
+    kind: 'mutation',
+    input: z.object({
+      provider: z.enum(['mock', 'qianwen']).optional(),
+      baseUrl: z.string().optional(),
+      apiKey: z.string().optional(),
+      clearApiKey: z.boolean().optional(),
+      model: z.string().optional(),
+      silenceGateMs: z.number().int().min(200).max(6000).optional(),
+      maxUtteranceMs: z.number().int().min(1000).max(120000).optional(),
+    }).passthrough(),
+    handler: (input) => {
+      try {
+        return saveASR(input);
+      } catch (e) {
+        throw new TRPCError(e.message, 'BAD_REQUEST');
+      }
+    },
+  },
+
+  'settings.asr.probe': {
+    kind: 'mutation',
+    input: z.object({
+      provider: z.enum(['mock', 'qianwen']).optional(),
+      baseUrl: z.string().optional(),
+      apiKey: z.string().optional(),
+      model: z.string().optional(),
+    }).passthrough().optional(),
+    handler: async (input = {}, { user }) => {
+      if (!rateLimit(`probe:${user.id}`, 8)) throw new TRPCError('连通性自检每分钟最多 8 次', 'TOO_MANY_REQUESTS');
+      try {
+        return await probeASR(input);
+      } catch (e) {
+        throw new TRPCError(`自检失败：${e.message}`, 'BAD_REQUEST');
+      }
+    },
+  },
+
+  'settings.asr.reset': {
+    kind: 'mutation', input: pass.optional(),
+    handler: () => resetASR(),
+  },
+
   'promptStudio.presets': {
     kind: 'query',
     input: z.object({ lang: z.string().optional() }).passthrough().optional(),
@@ -122,13 +223,15 @@ export default {
     kind: 'mutation',
     input: z.object({ image: z.string(), mode: z.enum(['normal', 'dualCamera']).optional(), current: pass.optional() }).passthrough(),
     handler: async ({ image, mode = 'normal', current = {} }) => {
-      // 真模型：视觉读壁纸 → 同色系底色 + 可读前景（文档 21 §2.6）
-      const vision = await generatePalette({ image, mode, current }).catch((e) => {
-        console.warn('[palette] 视觉配色失败，回退哈希采样:', e.message);
-        return null;
-      });
+      // 真模型：视觉读壁纸 → 同色系底色 + 可读前景（文档 21 §2.6）；失败直接报错
+      let vision = null;
+      try {
+        vision = await generatePalette({ image, mode, current });
+      } catch (e) {
+        throw new TRPCError(`自动配色失败：${e.message}`, 'INTERNAL_SERVER_ERROR');
+      }
       if (vision) return vision;
-      // 兜底：本地哈希采样（离线/视觉失败）
+      // mock 模式替身：本地哈希采样（离线）
       const h = crypto.createHash('sha1').update(image.slice(0, 4096)).digest();
       const lum = (h[0] + h[1] + h[2]) / 765;
       const dark = lum < 0.5;
@@ -151,12 +254,15 @@ export default {
     kind: 'mutation',
     input: z.object({ audioUrl: z.string().optional(), sessionId: z.string().optional(), audioBase64: z.string().optional() }).passthrough().optional(),
     handler: async (input = {}) => {
-      // 真 ASR：audioBase64 / http(s) audioUrl → 转写（复用千问 ASR）
-      const asr = await transcribeAudio({ audioBase64: input.audioBase64, audioUrl: input.audioUrl }).catch((e) => {
-        console.warn('[tools.stt] 转写失败，回退替身:', e.message);
-        return null;
-      });
+      // 真 ASR：audioBase64 / http(s) audioUrl → 转写（复用千问 ASR）；失败直接报错
+      let asr = null;
+      try {
+        asr = await transcribeAudio({ audioBase64: input.audioBase64, audioUrl: input.audioUrl });
+      } catch (e) {
+        throw new TRPCError(`语音转写失败：${e.message}`, 'INTERNAL_SERVER_ERROR');
+      }
       if (asr) return { text: asr.text, confidence: 0.96, segmentCount: 1, model: asr.model, source: 'asr' };
+      // mock 模式替身（未配置 ASR key）
       const samples = [
         '请先简单介绍一下你自己。',
         '你简历里提到的这个项目，你负责哪一块？',
@@ -208,42 +314,6 @@ export default {
     kind: 'mutation',
     input: z.object({ audioKey: z.string().optional() }).passthrough().optional(),
     handler: () => ({ matched: true, score: 0.91 }),
-  },
-
-  'pay.createOrder': {
-    kind: 'mutation',
-    input: z.object({ id: z.string(), channel: z.enum(['wxpay', 'alipay_page', 'alipay_wap']), from: z.string().optional() }).passthrough(),
-    handler: ({ id, channel, from = 'desktop' }, { user }) => {
-      const sku = id || 'weekly';
-      const orderId = cuid();
-      const amount = ({ trial: 1000, standard: 4900, weekly: 2900, monthly: 9900, quarterly: 24900 }[sku] ?? 2900);
-      run('INSERT INTO orders(id,user_id,sku,channel,status,amount,created_at) VALUES(?,?,?,?,?,?,?)',
-        orderId, user.id, sku, channel, 'CREATED', amount, nowIso());
-      return {
-        orderNumber: `ML${Date.now()}${orderId.slice(-4)}`,
-        checkoutUrl: `http://${config.host}:${config.port}/pay/mock?order=${orderId}&sku=${sku}&channel=${channel}&from=${from}`,
-        amount, sku, channel,
-      };
-    },
-  },
-
-  'pay.mockConfirm': {
-    kind: 'mutation',
-    auth: false,
-    input: z.object({ order: z.string(), sku: z.string().optional() }).passthrough(),
-    handler: ({ order, sku = 'weekly' }) => {
-      const row = one('SELECT * FROM orders WHERE id=?', order);
-      if (!row) throw new TRPCError('订单不存在', 'NOT_FOUND');
-      if (row.status === 'PAID') return { order, status: 'PAID', already: true };
-      run("UPDATE orders SET status='PAID' WHERE id=?", order);
-      // 生效权益：周卡 +60 分钟 / 月卡 +300 分钟（本地模拟）
-      const addMinutes = { trial: 5, standard: 30, weekly: 60, monthly: 300, quarterly: 900 }[sku] ?? 60;
-      const user = one('SELECT * FROM users WHERE id=?', row.user_id);
-      if (user) {
-        run('UPDATE users SET interview_time = interview_time + ? WHERE id=?', addMinutes, user.id);
-      }
-      return { order, status: 'PAID', sku, addedMinutes: addMinutes };
-    },
   },
 
   'announcement.getActive': {

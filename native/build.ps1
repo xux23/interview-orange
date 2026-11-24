@@ -1,4 +1,4 @@
-# 原生壳构建环境（隔离：只用项目内 .tools，不写系统 PATH / 注册表）
+﻿# 原生壳构建环境（隔离：只用项目内 .tools，不写系统 PATH / 注册表）
 # 用法：. .\build.ps1 ;  cargo build --manifest-path native\Cargo.toml
 $root = Split-Path -Parent $PSScriptRoot
 $tc = Join-Path $root ".tools\rustup\toolchains\stable-x86_64-pc-windows-gnu"

@@ -50,7 +50,7 @@ const PAIRS = [
 const SERVER_EVENTS = [
   'mock.questionStart', 'mock.question', 'mock.questionEnd',
   'ai.messageStart', 'ai.message', 'ai.messageEnd',
-  'ai.prewarm', 'ai.turnKind', 'ai.onMsg', 'ai.webSearch',
+  'ai.prewarm', 'ai.turnKind', 'ai.onMsg',
   'stt.pending', 'stt.speaker', 'stt.changed', 'stt.segment', 'stt.turnEnd',
   'audio.permission',
   'exam.peers', 'exam.session', 'exam.start', 'exam.progress',
@@ -58,6 +58,7 @@ const SERVER_EVENTS = [
 ];
 
 const seen = new Map();
+const regressions = [];
 const mark = (ev) => seen.set(ev, (seen.get(ev) || 0) + 1);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -73,7 +74,7 @@ async function main() {
   const goals = await call('goal.getGoals', 'query', {}, token);
   const session = await call('session.createSession', 'mutation', {
     type: 'MOCK_INTERVIEW', resumeId: resumes[0].id, goalId: goals[0].id,
-    metadata: { assistMode: true, difficulty: '3_5_YEARS', lang: 'zh-CN', webSearch: true },
+    metadata: { assistMode: true, difficulty: '3_5_YEARS', lang: 'zh-CN' },
   }, token);
 
   const s = io(BASE, { auth: { token, locale: 'zh', sessionId: session.id }, transports: ['websocket'], reconnection: false });
@@ -90,7 +91,7 @@ async function main() {
   s.emit('mock.toggleAssist', { assistMode: true });
   s.emit('mock.answer', { answer: '我在电商做订单链路，P99 110ms，用 MySQL 和 Redis。' });
   await wait(2400);
-  // 用 stt.inject 带技术名词，触发 ai.webSearch + 完整 assistant 流
+  // stt.inject → 完整 assistant 流（webSearch 假触发已移除）
   s.emit('stt.inject', { text: 'MySQL 的索引为什么用 B+ 树？什么时候回表？' });
   await wait(2600);
 
@@ -133,6 +134,35 @@ async function main() {
   s.emit('stt.speaker.correct', { utteranceId: 'x', speakerId: 'self' });
   s.emit('stt.end', {});
 
+  // 回归：mock ASR 下 self 音频没有真实转写，绝不能伪造为面试官问题
+  if (!realAsr) {
+    const clean = await call('session.createSession', 'mutation', {
+      type: 'MOCK_INTERVIEW', resumeId: resumes[0].id, goalId: goals[0].id,
+      metadata: { assistMode: true, difficulty: '3_5_YEARS', lang: 'zh-CN' },
+    }, token);
+    const c = io(BASE, { auth: { token, locale: 'zh', sessionId: clean.id }, transports: ['websocket'], reconnection: false });
+    let question = 0, assistant = 0, selfSegment = 0;
+    c.on('mock.question', () => { question += 1; });
+    c.on('ai.message', () => { assistant += 1; });
+    c.on('stt.segment', (seg) => { if (seg?.completed && seg.speakerId === 'self') selfSegment += 1; });
+    await wait(600);
+    c.emit('stt.start', { silenceGateMs: 200, speakerId: 'self' });
+    for (let i = 0; i < 3; i++) {
+      c.emit('stt.data', { data: 'A'.repeat(4096), speakerId: 'self' });
+      await wait(120);
+    }
+    await wait(1600);
+    const dto = await call('session.getSession', 'query', { id: clean.id }, token);
+    const interviewerMessages = (dto.messages || []).filter((m) => m.role === 'INTERVIEWER').length;
+    regressions.push([
+      'mock self 音频不伪造面试官问题',
+      question === 0 && assistant === 0 && selfSegment === 0 && interviewerMessages === 0,
+      `question=${question} assistant=${assistant} selfSegment=${selfSegment} interviewerMessages=${interviewerMessages}`,
+    ]);
+    c.emit('stt.end', { speakerId: 'self' });
+    c.disconnect();
+  }
+
   const d = io(`${BASE}/desktop`, { auth: { token, locale: 'zh' }, transports: ['websocket'], reconnection: false });
   attach(d);
   await wait(700);
@@ -162,8 +192,16 @@ async function main() {
   for (const [c2s, ev, ok] of rows) {
     console.log(`[${ok ? 'PASS' : 'MISS'}] ${c2s} → ${ev}${seen.has(ev) ? ` ×${seen.get(ev)}` : ''}`);
   }
+  if (regressions.length) {
+    console.log('\n=== Mock ASR 语义回归 ===');
+    for (const [name, pass, detail] of regressions) {
+      console.log(`[${pass ? 'PASS' : 'FAIL'}] ${name} — ${detail}`);
+    }
+  }
+  const regressionFails = regressions.filter((r) => !r[1]).length;
   console.log(`\n合计 ${rows.length} 项，通过 ${rows.length - fail.length}，缺失 ${fail.length}`);
-  if (fail.length) process.exitCode = 1;
+  if (regressions.length) console.log(`回归 ${regressions.length} 项，失败 ${regressionFails}`);
+  if (fail.length || regressionFails) process.exitCode = 1;
 }
 
 main().catch((e) => { console.error('[events] 失败：', e); process.exitCode = 1; });

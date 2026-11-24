@@ -5,7 +5,7 @@
  *
  * provider：
  *   - qianwen：OpenAI 兼容网关 /chat/completions，音频走 content[].input_audio（data-URL 形式放 data 字段），
- *     模型默认 qwen3.8-omni-flash。实测中/英文转写正确；enable_thinking:false + temperature:0 下 ~1.2s/句。
+ *     模型默认 qwen3.5-omni-flash。实测中/英文转写正确；enable_thinking:false + temperature:0 下 ~0.7s/句。
  *   - mock：未配置 key 时的本地替身（由 socket.js 走旧行为），本模块不参与。
  *
  * VAD 辅助：帧能量（RMS/峰值）判定，供 socket.js 做切句。
@@ -50,28 +50,39 @@ export function pcmPeak(pcm) {
   return peak / 32768;
 }
 
-/** 整句转写（qwenwen 网关）。失败抛错，由调用方决定回退。 */
+/** 整句转写（qwenwen 网关）。失败抛错，由调用方决定回退。总超时 ML_ASR_TIMEOUT_MS（默认 60s）。 */
 export async function transcribe({ pcm, sampleRate = config.asr.sampleRate } = {}) {
   if (!asrEnabled()) throw new Error('ML_ASR_API_KEY 未配置（asr provider=qianwen）');
   const started = Date.now();
   const wav = pcm16ToWav(pcm, sampleRate);
-  const res = await fetch(`${config.asr.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${config.asr.apiKey}` },
-    body: JSON.stringify({
-      model: config.asr.model,
-      temperature: 0,
-      enable_thinking: false,
-      max_tokens: 1024,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: '逐字转写音频中的人声语音，保留原语言与口语原文（含语气词），只输出转写文本本身，不要任何解释或标点修饰。若音频里没有人声，只输出空字符串。' },
-          { type: 'input_audio', input_audio: { data: `data:audio/wav;base64,${wav.toString('base64')}` } },
-        ],
-      }],
-    }),
-  });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), Number(process.env.ML_ASR_TIMEOUT_MS || 60_000));
+  let res;
+  try {
+    res = await fetch(`${config.asr.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${config.asr.apiKey}` },
+      body: JSON.stringify({
+        model: config.asr.model,
+        temperature: 0,
+        enable_thinking: false,
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: '逐字转写音频中的人声语音，保留原语言与口语原文（含语气词），只输出转写文本本身，不要任何解释或标点修饰。若音频里没有人声，只输出空字符串。' },
+            { type: 'input_audio', input_audio: { data: `data:audio/wav;base64,${wav.toString('base64')}` } },
+          ],
+        }],
+      }),
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    if (ctrl.signal.aborted) throw new Error(`ASR 转写超时（${(Number(process.env.ML_ASR_TIMEOUT_MS || 60_000)) / 1000}s，网关挂起）`);
+    throw new Error(`ASR 网关连接失败（${config.asr.baseUrl}）：${e?.cause?.message || e?.message || e}`);
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) throw new Error(`ASR 上游 ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const json = await res.json();
   const text = String(json.choices?.[0]?.message?.content ?? '').trim();

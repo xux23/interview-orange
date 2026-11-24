@@ -190,9 +190,11 @@ export default {
       try {
         items = await generatePredictionItems({ goal, resume, bankRows: scored, experience, count });
       } catch (e) {
-        console.warn('[prediction] 模型押题失败，回退题库:', e.message);
+        // 真模型押题失败直接报错（不再回退题库照抄）
+        throw new TRPCError(`押题生成失败：${e.message}`, 'INTERNAL_SERVER_ERROR');
       }
       if (!items) {
+        // mock 模式替身：题库粗排
         source = 'bank';
         items = scored.slice(0, count).map((q, i) => ({
           id: cuid(12),

@@ -13,7 +13,8 @@ import {
   loadPresets,
 } from './prompts.js';
 import { interviewAnswer, examAnswer, nextQuestion, interviewerReaction, buildReport } from './mockBrain.js';
-import { openaiComplete, providerName, streamText } from './provider.js';
+import { openaiComplete, providerName, createStreamQueue } from './provider.js';
+import { imageForVision } from './enrich.js';
 import { config } from '../config.js';
 
 export function loadResume(userId, resumeId) {
@@ -73,8 +74,8 @@ export async function interviewRun({ userId, question, lang = 'zh-CN', styleValu
   };
 }
 
-/** 流式面试答题（socket 用）：yield 文本增量 */
-export async function* interviewStream({ userId, question, lang = 'zh-CN', styleValue = 'natural', resumeId, goalId, materialIds, customStyle, history = [] }) {
+/** 流式面试答题（socket 用）：yield 文本增量；signal 供 ai.interrupt 真打断 */
+export async function* interviewStream({ userId, question, lang = 'zh-CN', styleValue = 'natural', resumeId, goalId, materialIds, customStyle, history = [], signal }) {
   const ctx = buildContext(userId, { resumeId, goalId, materialIds });
   const knowledge = buildKnowledge(ctx.materials);
   const systemPrompt = buildInterviewSystemPrompt({
@@ -82,17 +83,18 @@ export async function* interviewStream({ userId, question, lang = 'zh-CN', style
   });
 
   if (providerName() === 'openai') {
-    const queue = [];
-    let done = false;
+    // 事件驱动队列：上游 onDelta 直推，迭代器零轮询转发。
+    // user 消息模板对齐官方（05 号还原）：本轮面试官转写包 <USER_MESSAGE>，
+    // 历史里我说出口的话由调用方包 <my_spoken_answer> 后经 history 传入。
+    const q = createStreamQueue();
     const task = openaiComplete({
       system: systemPrompt,
-      messages: [...history, { role: 'USER', content: question }],
-      onDelta: (d) => queue.push(d),
-    }).finally(() => { done = true; });
-    while (!done || queue.length) {
-      if (queue.length) yield queue.shift();
-      else await new Promise((r) => setTimeout(r, 25));
-    }
+      messages: [...history, { role: 'USER', content: `<USER_MESSAGE>\n${question}\n</USER_MESSAGE>` }],
+      onDelta: (d) => q.push(d),
+      signal,
+    }).catch((e) => q.fail(e))
+      .finally(() => q.end());
+    for await (const d of q) yield d;
     await task;
     return;
   }
@@ -107,72 +109,55 @@ async function* streamChunks(text, size = 3) {
   }
 }
 
-/** 笔试解题（流式）：openai 模式直接透传上游真实增量（不再缓冲后假流式）；失败逐级回退 视觉→文本→mock */
-export async function* examSolveStream({ userId, questionText, screenshotPath, presetSlug, mode = 'quick', customization, lang = 'zh-CN' }) {
+/** 笔试解题（流式）：openai 模式单次尝试（有有效截图走视觉模型，否则纯文本），
+ *  失败直接抛错由调用方报给前端（不再降级文本/mock）；signal 供 exam.abort 真打断 */
+export async function* examSolveStream({ userId, questionText, screenshotPath, presetSlug, mode = 'quick', customization, lang = 'zh-CN', signal }) {
   const preset = presetSlug ? examPreset(presetSlug, lang) : null;
   const systemPrompt = buildExamSystemPrompt({ lang, preset, customization, styleValue: customization?.codeQuality || 'standard' });
   const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
   if (providerName() === 'openai') {
-    // 组装尝试链：视觉（截图有效）→ 纯文本
-    const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-    const attempts = [];
+    let attempt = null;
     if (screenshotPath && fs.existsSync(screenshotPath)) {
-      try {
-        const buf = fs.readFileSync(screenshotPath);
-        let w = 0, h = 0;
-        if (buf.length > 24 && buf.subarray(0, 8).equals(PNG_SIG)) { w = buf.readUInt32BE(16); h = buf.readUInt32BE(20); }
-        if (w >= 16 && h >= 16) {
-          attempts.push({
-            tag: 'vision',
-            model: config.ai.visionModel,
-            userContent: [
-              { type: 'text', text: `题目：${questionText || '（请从截图中识别题目并完整作答）'}` },
-              { type: 'image_url', image_url: { url: `data:image/png;base64,${buf.toString('base64')}` } },
-            ],
-          });
-        }
-      } catch { /* 截图不可读，跳过视觉 */ }
-    }
-    attempts.push({
-      tag: 'text',
-      userContent: `题目：${questionText || '（未提供题目）'}\n模式：${mode}`,
-    });
-
-    let lastErr = null;
-    for (const a of attempts) {
-      let emitted = 0;
-      try {
-        const queue = [];
-        let done = false;
-        let err = null;
-        const task = openaiComplete({
-          system: systemPrompt,
-          userContent: a.userContent,
-          maxTokens: 1400,
-          ...(a.model ? { model: a.model } : {}),
-          onDelta: (d) => queue.push(d),
-        }).catch((e) => { err = e; }).finally(() => { done = true; });
-
-        while (!done || queue.length) {
-          if (queue.length) {
-            emitted += 1;
-            yield { type: 'delta', text: queue.shift() };
-          } else {
-            await pause(15);
-          }
-        }
-        await task;
-        if (err && emitted === 0) throw err;
-        if (emitted === 0) throw new Error('上游无输出');
-        return;
-      } catch (e) {
-        lastErr = e;
-        if (emitted > 0) return; // 已吐出内容：不再重试，避免重复
-        console.warn(`[exam] ${a.tag} 失败，降级下一级:`, e.message);
+      const buf = fs.readFileSync(screenshotPath); // 读取失败自然抛错
+      const img = imageForVision(buf);
+      if (img) {
+        attempt = {
+          tag: 'vision',
+          model: config.ai.visionModel,
+          userContent: [
+            { type: 'text', text: `题目：${questionText || '（请从截图中识别题目并完整作答）'}` },
+            { type: 'image_url', image_url: { url: img.url } },
+          ],
+        };
       }
     }
-    console.warn('[exam] 真实模型全部失败，回退 mock:', lastErr?.message);
+    if (!attempt) {
+      if (!questionText) throw new Error('没有可用的题目输入：截图缺失或无效（需 PNG/JPEG/WebP/BMP ≥16×16），且未填写题面文本');
+      attempt = { tag: 'text', userContent: `题目：${questionText}\n模式：${mode}` };
+    }
+
+    let emitted = 0;
+    const q = createStreamQueue();
+    let err = null;
+    const task = openaiComplete({
+      system: systemPrompt,
+      userContent: attempt.userContent,
+      maxTokens: 1400,
+      ...(attempt.model ? { model: attempt.model } : {}),
+      onDelta: (d) => q.push(d),
+      signal,
+    }).catch((e) => { err = e; })
+      .finally(() => q.end());
+    for await (const d of q) {
+      emitted += 1;
+      yield { type: 'delta', text: d };
+    }
+    await task;
+    if (err && emitted === 0) throw err;
+    if (emitted === 0) throw new Error('上游模型无输出');
+    if (err) console.warn(`[exam] 流式尾部出错（已输出 ${emitted} 段，保留部分答案）:`, err.message);
+    return;
   }
 
   const r = examAnswer({ questionText, preset, mode, screenshot: Boolean(screenshotPath) });
@@ -208,12 +193,11 @@ export function mockNextQuestion({ goal, round = 'FIRST', turn = 0, difficulty =
 }
 export const mockReaction = interviewerReaction;
 
-/** promptStudio.assist：openai 模式真改写；mock/失败回退本地压缩 */
+/** promptStudio.assist：openai 模式真改写（失败直接抛错）；mock 模式为本地压缩主路径 */
 export async function promptAssist({ scene, mode = 'refine', draft, lang = 'zh-CN', instruction }) {
   if (!instruction) throw Object.assign(new Error('请先说明希望如何修改'), { code: 'BAD_REQUEST' });
   if (providerName() === 'openai') {
-    try {
-      const r = await openaiComplete({
+    const r = await openaiComplete({
         system: `你是提示词工程师。用户会给一段「${scene === 'exam' ? '笔试答题' : '面试回答'}」提示词草稿和一条修改要求。按修改要求改写草稿，保持输出协议（${scene === 'exam' ? '**答案：** + [[FOLLOWUP: …]]' : '**核心要点** + **参考回答**'}）与分档字数约束。只输出改写后的提示词全文，不要任何解释。`,
         messages: [{ role: 'USER', content: `修改要求：${instruction}\n\n提示词草稿：\n${draft}` }],
         maxTokens: 1200,
@@ -226,9 +210,6 @@ export async function promptAssist({ scene, mode = 'refine', draft, lang = 'zh-C
         lang,
         provider: providerName(),
       };
-    } catch (e) {
-      console.warn('[promptAssist] 真实改写失败，回退本地压缩:', e.message);
-    }
   }
   const lines = String(draft || '').split('\n');
   const heads = lines.filter((l) => l.startsWith('##') || /^-\s/.test(l)).slice(0, 6);
@@ -248,7 +229,7 @@ export async function promptAssist({ scene, mode = 'refine', draft, lang = 'zh-C
 
 const clampScore = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
 
-/** LLM rubric 复盘报告（openai 模式）：输出严格 JSON，映射为官方报告 schema；解析失败由上层回退本地 */
+/** LLM rubric 复盘报告（openai 模式）：输出严格 JSON，映射为官方报告 schema；两次解析重试后仍失败则抛错 */
 async function llmReport({ session, messages, goal, resume }) {
   const convo = messages
     .filter((m) => ['INTERVIEWER', 'USER', 'ASSISTANT', 'SYSTEM'].includes(m.role))
@@ -319,16 +300,13 @@ async function llmReport({ session, messages, goal, resume }) {
   };
 }
 
-/** 复盘报告：openai 模式 LLM rubric（对齐文档 25 §3 的 ~80% 置信推断），失败回退本地规则 */
+/** 复盘报告：openai 模式 LLM rubric（对齐文档 25 §3 的 ~80% 置信推断），失败直接抛错由调用方提示；
+ *  mock 模式为本地 rubric 主路径 */
 export async function reportFor(session, messages, ctx) {
   const goal = ctx?.goal;
   const resume = ctx?.resume;
   if (providerName() === 'openai') {
-    try {
-      return await llmReport({ session, messages, goal, resume });
-    } catch (e) {
-      console.warn('[report] LLM 评分失败，回退本地 rubric:', e.message);
-    }
+    return llmReport({ session, messages, goal, resume });
   }
   return buildReport({ session, messages, goal, resume });
 }

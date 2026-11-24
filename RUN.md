@@ -8,47 +8,79 @@
 | WebView2 | Windows 10/11 自带 | Rust 原生壳依赖 |
 | 网络 | 首次安装依赖需联网；运行期完全离线（配真实模型则调用所配网关） | — |
 
-> 本仓库已自带 `node_modules` 与 Rust 工具链（`.tools/`），可整目录搬运后直接运行；
-> 最省事的方式是**双击 `启动.bat`**（自动起服务 + Rust 原生壳）。
+> 本仓库已自带 `node_modules`；最省事的方式是**双击 `启动.bat`**。
+> Rust 工具链（`.tools/`）当前已重建就绪；若被清除，先按 §3「重建工具链」跑一条命令即可恢复，
+> 服务与浏览器模式（`.\启动.ps1 -Browser`）不依赖工具链，任何时候可用。
 
 ## 1. 首次启动
 
 ```powershell
-cd D:\xux\Desktop\面试橙ai\面试橙
+cd <项目根>               # 整目录放哪都行，路径全相对项目根
 npm run build            # 构建前端到 ./public（改过前端才需要重跑）
 node server/index.js     # 起本地服务，首次自动建表 + seed 演示数据
 ```
 
-浏览器打开 **http://127.0.0.1:8756** —— 演示账号自动登录（`user.getTempToken → loginByTempToken`）。
+浏览器打开 **http://127.0.0.1:8756** —— 账号模块已移除：无需登录，直接进入本地档案工作台。
 
 ## 2. 两套前端
 
 | 地址 | 前端 | 说明 |
 |---|---|---|
 | http://127.0.0.1:8756 | 自研 UI（#main/#overlay/#mock/#mock-exam） | 代码可读可改 |
-| http://127.0.0.1:8756/legacy/ | **原版前端原样挂载** | 桩自动登录演示账号；公告/使用须知/工作台读本地数据 |
+| http://127.0.0.1:8756/legacy/ | **原版前端原样挂载** | 桩兼容 token（账号已移除）；公告/使用须知/工作台读本地数据 |
 
 原版模式原理与边界见 README「原版前端挂载」一节；截图自检：`node scripts/legacy-shot.mjs <cdp端口> out.png`。
 
 ## 3. Rust 原生壳（推荐，原版技术栈）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File native\run.ps1 -Build    # 首次构建 + 启动
-powershell -ExecutionPolicy Bypass -File native\run.ps1           # 之后直接启动
-powershell -ExecutionPolicy Bypass -File native\run.ps1 -SelfTest 1   # WDA 防截屏自检
-powershell -ExecutionPolicy Bypass -File native\run.ps1 -SelfTest 2   # WASAPI 采集自检
+powershell -ExecutionPolicy Bypass -File native\run.ps1 -Build          # 首次构建 + 启动
+powershell -ExecutionPolicy Bypass -File native\run.ps1 -Build -Release -BuildOnly  # release 构建（strip+lto，exe ~6MB）不启动
+powershell -ExecutionPolicy Bypass -File native\run.ps1 -Release        # 运行 release 版
+powershell -ExecutionPolicy Bypass -File native\run.ps1 -Build -BuildOnly  # 只构建不启动（脚本/自检用）
+powershell -ExecutionPolicy Bypass -File native\run.ps1                 # 之后直接启动
+powershell -ExecutionPolicy Bypass -File native\run.ps1 -SelfTest 1     # WDA 防截屏自检
+powershell -ExecutionPolicy Bypass -File native\run.ps1 -SelfTest 2     # WASAPI 采集自检
 ```
 
 - 环境：Rust 1.100（gnu）+ rust-lld 自包含链接，全部在 `.tools/`，不需要 MSVC/gcc/MSYS2
-- 产物：`D:\ml-build\debug\interview-orange.exe`（junction 指向项目内 `.tools\target`）
+  （`.tools/` 被清除后先跑下述「重建工具链」）
+- 产物：`<构建目录>\debug\interview-orange.exe`。构建路径由 `run.ps1` 动态解析：
+  项目路径纯 ASCII → 直接用项目内真实路径；含中文 → 自动在任一可用盘符根创建/复用
+  ASCII junction `<盘符>:\ml-src → <项目根>`，产物目录（CARGO_TARGET_DIR）与 `TMP/TEMP`
+  都经它变成 ASCII（物理文件仍在项目内，卸载删 junction 即可；dlltool/lld/windres 不认中文路径）。
+  windres/gcc 的路径改写 shim 装在 `.tools\bin\`（`toolchain.ps1` 自动编译，见「重建工具链」）
+- 端口：原生壳跟随 `ML_PORT`（默认 8756），与 `.env` / `启动.ps1 -Port` 同口径
 - 热键：`Ctrl+Alt+Esc` panic · `Ctrl+Alt+H` 浮窗显隐 · `Ctrl+Alt+Shift+X` 关闭浮窗 · `Ctrl+Alt+Shift+Q` 退出
 - 自检日志会直接打印 `PASS/FAIL`，见上面「Rust 原生壳」表
 
-### 还原
+### 重建工具链（.tools 被清除 / 搬到新机器后）
+
+一条命令（国内镜像直连，约 300 MB，全部装入项目内 `.tools`）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .tools\restore.ps1        # 停进程 + 清构建产物 + 拆 junction
-powershell -ExecutionPolicy Bypass -File .tools\restore.ps1 -Full  # 连 Rust 工具链一起删
+powershell -ExecutionPolicy Bypass -File native\toolchain.ps1   # rustup(stable-gnu) + mingw64(gcc/windres/dlltool)
+powershell -ExecutionPolicy Bypass -File native\run.ps1 -Build -BuildOnly  # 然后构建
+```
+
+- Rust 工具链：`rsproxy.cn` 镜像（`RUSTUP_DIST_SERVER=https://rsproxy.cn`，注意 dist 根不在 /rustup 子路径）
+- mingw64：niXman `16.2.0-rt_v14-rev1`（posix-seh-ucrt），GitHub release 经 `ghfast.top` 中转下载，
+  备选 `ghproxy.net`；解压用 Bandizip 控制台 `bz.exe`（或系统 7-Zip）
+- crates 依赖：`native/.cargo/config.toml` 已配 rsproxy sparse 镜像，`cargo build` 自动走
+- 幂等：已存在的组件自动跳过；强制重装删对应子目录（`.tools\rustup` / `.tools\cargo` / `.tools\binutils`）
+
+### 还原
+
+`restore.ps1` 原随 `.tools/` 分发，已随之删除。手工还原口径：
+
+```powershell
+# 清构建产物（物理文件在项目内）
+Remove-Item -Recurse -Force .tools\target, .tmp-build
+# 拆掉盘符根的 ASCII junction（如果存在，只删 junction 本身）
+Get-PSDrive -PSProvider FileSystem | ForEach-Object { Join-Path $_.Root 'ml-src' } |
+  Where-Object { (Get-Item $_ -Force).LinkType -eq 'Junction' } | Remove-Item -Force
+# 连工具链一起删
+Remove-Item -Recurse -Force .tools
 ```
 
 系统级零改动：不写注册表、不改用户/系统 PATH、不装全局包（脚本末尾会打印残留检查）。
@@ -89,22 +121,35 @@ $env:ML_DIAG   = '1'   # 启动 4s 后把 DOM 诊断经 /__diag 回传，打印�
 
 ## 6. 切换 AI provider / 启用真实语音识别
 
-编辑 `面试橙/.env`（可从 `.env.example` 复制）：
+**首选：设置页（运行时，不用重启）**
+
+主窗 → 设置 → **AI 接入**：填 provider（mock/openai）、Base URL、API Key、文本模型、视觉模型、temperature，
+点「连通性自检」先验证（真发一次 1-token 补全，返回逐项 checks 与延迟），再「保存并热切换」。
+
+同一页下方 **语音识别**：provider（mock/qianwen）、Base URL、API Key、转写模型、静音收句门限、单句最长；
+自检真发一段 0.4s 静音 WAV 走 `input_audio` 通道（验 key 权限 + 网关是否支持音频块 + 模型名）。
+
+两处都写进 `data/app.db.app_settings`（`key='ai'` / `key='asr'`），优先级 **设置页 > .env > 出厂默认**，
+「回退 .env」一键清掉覆盖。`http://127.0.0.1:8756/healthz` 的
+`provider` / `model` / `providerSource` / `asr` / `asrSource` 反映当前生效值。
+
+**备选：编辑 `面试橙/.env`**（可从 `.env.example` 复制，改完要重启服务）：
 
 ```ini
 # 文本生成（可选）
 ML_AI_PROVIDER=openai
-ML_AI_BASE_URL=https://api.openai.com/v1
+ML_AI_BASE_URL=https://maas.qianwenaiapi.com/compatible-mode/v1
 ML_AI_API_KEY=sk-xxxx
-ML_AI_MODEL=gpt-4o-mini
+ML_AI_MODEL=deepseek-v4.1-flash
+ML_AI_VISION_MODEL=qwen3.5-omni-flash
 
-# 语音识别（可选，不配则保持本地替身）
+# 语音识别（可选，不配则保持本地替身；也可在设置页改并热切换）
 ML_ASR_BASE_URL=https://maas.qianwenaiapi.com/compatible-mode/v1
 ML_ASR_API_KEY=sk-xxxx
-ML_ASR_MODEL=qwen3.8-omni-flash
+ML_ASR_MODEL=qwen3.5-omni-flash
 ```
 
-重启服务即生效；接口与页面不变。`http://127.0.0.1:8756/healthz` 的 `asr` 字段可查当前状态。
+接口与页面不变。`http://127.0.0.1:8756/healthz` 的 `asr` 字段可查当前 STT 状态。
 
 启用真实 STT 后：
 
@@ -125,10 +170,12 @@ node scripts/smoke.mjs
 语音与真实模型专项：
 
 ```powershell
-node scripts/socket-events.mjs   # 44/44 事件矩阵，含真实转写实测（打印 [asr] 实测转写）
+node scripts/socket-events.mjs   # 43 项事件矩阵，含真实转写实测（打印 [asr] 实测转写）
 node scripts/asr-separation.mjs  # 双路并发分离（双中文样本）：面试官(Guest-1)/本人(self) 互不混音
 node scripts/real-ai-e2e.mjs     # 真实模型全链路 9 项：出题/答案/笔试视觉解题/改写/LLM 报告
 node scripts/p0p1-verify.mjs     # P0/P1 专项 6 项：押题生成/视觉配色/真转写/热词/岗位推荐/资料生成
+npm run test:ai                  # AI 配置中心 15 项：假网关+热切换+双链路+不可达+回退（会自动 reset）
+npm run test:asr                 # ASR 配置中心 15 项：假音频网关+input_audio 真转写+热切换+回退替身
 ```
 
 ## 8. 常见问题

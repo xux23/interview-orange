@@ -1,65 +1,23 @@
 /**
- * 鉴权：无第三方依赖的 HMAC 令牌（形态对齐实测 JWT payload {userId,type,iat,exp}）。
- * 客户端从 localStorage 取 token，走 authorization: Bearer <token>。
+ * 本地档案（账号模块已移除，2026-11-23）：
+ * 不再有登录、token 校验、订阅与计费——所有 tRPC 请求与 socket 连接一律归属
+ * DB 中按创建时间排序的第一个用户（seed 建立的本地档案）。
+ * client 侧保留的 authorization 头与兼容桩 token（user.getTempToken/loginByTempToken）
+ * 一律忽略，仅为 /legacy 原版前端与既有测试脚本提供协议形状。
  */
 import crypto from 'node:crypto';
-import { config } from './config.js';
 import { one } from './db.js';
-import { cuid, nowIso } from './util.js';
+import { config } from './config.js';
 
-const b64 = (buf) => Buffer.from(buf).toString('base64url');
-const sign = (payload) =>
-  crypto.createHmac('sha256', config.secret).update(payload).digest('base64url');
-
-export function issueToken(userId, type = 'access') {
-  const now = Date.now();
-  const body = b64(JSON.stringify({ userId, type, iat: Math.floor(now / 1000), exp: Math.floor((now + config.tokenTtlMs) / 1000) }));
-  return `${body}.${sign(body)}`;
+/** 本地单一档案用户（无则 null，由调用方给出「请先 seed」提示） */
+export function singleUser() {
+  return one('SELECT * FROM users ORDER BY created_at ASC LIMIT 1');
 }
 
-export function verifyToken(token) {
-  if (!token || typeof token !== 'string' || !token.includes('.')) return null;
-  const [body, sig] = token.split('.');
-  if (!body || !sig) return null;
-  const expect = sign(body);
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expect);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
-  try {
-    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    if (!payload?.userId || payload.exp * 1000 < Date.now()) return null;
-    return payload;
-  } catch {
-    return null;
-  }
+/** tRPC 兼容入口：忽略 token，恒返回本地档案 */
+export function currentUser() {
+  return singleUser();
 }
 
-export function bearer(req) {
-  const h = req.headers?.authorization || '';
-  let t = '';
-  if (h.startsWith('Bearer ')) t = h.slice(7).trim();
-  else if (h.startsWith('bearer ')) t = h.slice(7).trim();
-  // 容错：原版前端在某些路径会把 token JSON.stringify 多层后回存，逐层解开
-  for (let i = 0; i < 6 && t.startsWith('"') && t.endsWith('"') && t.length > 1; i++) {
-    try {
-      const parsed = JSON.parse(t);
-      if (typeof parsed === 'string') t = parsed;
-      else break;
-    } catch {
-      t = t.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    }
-  }
-  return t;
-}
-
-/** 取当前用户；未登录返回 null（不抛错，便于 visitor 接口） */
-export function currentUser(req) {
-  const payload = verifyToken(bearer(req));
-  if (!payload) return null;
-  const user = one('SELECT * FROM users WHERE id=?', payload.userId);
-  return user || null;
-}
-
+/* ── 以下仅为兼容旧引用保留（不再参与鉴权） ── */
 export const hashPassword = (pwd) => crypto.scryptSync(pwd || '', config.secret, 32).toString('hex');
-export const newUserId = () => cuid();
-export const createdAt = () => nowIso();

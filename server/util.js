@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
 export const cuid = (len = 25) => {
@@ -41,3 +43,22 @@ export function rateLimit(key, perMinute) {
   return true;
 }
 export const resetRateLimits = () => hits.clear();
+
+/** 目录滚动清理：按 mtime 只保留最近 keep 个文件（screenshots/uploads 防无限增长） */
+export function pruneDir(dir, keep) {
+  try {
+    const entries = fs.readdirSync(dir)
+      .map((f) => {
+        const p = path.join(dir, f);
+        try { const st = fs.statSync(p); return st.isFile() ? { p, mtime: st.mtimeMs } : null; } catch { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const e of entries.slice(keep)) {
+      try { fs.unlinkSync(e.p); } catch { /* 占用时忽略 */ }
+    }
+    return Math.max(0, entries.length - keep);
+  } catch {
+    return 0; // 目录不存在等
+  }
+}

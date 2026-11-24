@@ -16,6 +16,9 @@ export function migrate() {
   db.exec(`
   CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
 
+  -- 运行时设置（设置页写入，优先于 .env；整目录搬迁时随 data/app.db 一起走）
+  CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     phone TEXT UNIQUE,
@@ -138,6 +141,9 @@ export function migrate() {
   );
 
   CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+  -- 常用查询路径：会话转写 / 用户会话列表
+  CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_sessions_user_status ON sessions(user_id, status);
   `);
 }
 

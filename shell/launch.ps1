@@ -1,4 +1,4 @@
-<#
+﻿<#
  * 桌面壳（不依赖 Electron）：用 Chromium 系浏览器（Edge/Chrome）的 --app 模式开窗，
  * 再用 Win32 API 把浮窗钉成「置顶 + 不进任务栏 + 半透明」，等价于 Tauri 的
  * transparent / alwaysOnTop / skipTaskbar 三件套。

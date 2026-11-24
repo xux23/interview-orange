@@ -16,11 +16,12 @@
 ┌───────────────────────────────────────────▼──────────────────────────────────────────────────┐
 │ server/（Node，零原生依赖）                                                                   │
 │   index.js   服务入口（tRPC / 上传 / 静态 / Socket 挂载）                                      │
-│   trpc/*     tRPC v11 兼容层：92 个过程，query=GET mutation=POST，错误码对齐实测                │
+│   trpc/*     tRPC v11 兼容层：101 个过程，query=GET mutation=POST，错误码对齐实测               │
 │   socket.js  root（面试）/desktop（笔试）双 namespace，逐字流式                                │
 │   ai/        官方提示词加载 → systemPrompt 组装 → pipeline → provider(mock|openai)            │
-│   ai/asr.js  真实 STT（可选）：VAD 收句 → qwen3.8-omni-flash 整句转写 → 官方 stt 事件序列      │
+│   ai/asr.js  真实 STT（可选）：VAD 收句 → qwen3.5-omni-flash 整句转写 → 官方 stt 事件序列      │
 │   ai/enrich.js 模型增强：押题生成/视觉配色(BMP→PNG)/真转写/热词抽取/岗位推荐/资料问答           │
+│   settings.js 运行时配置中心：app_settings 两 section(ai/asr) 覆盖 .env → 活对象热切换 + 连通性自检 │
 │   db.js      node:sqlite 表结构（对齐 prisma AiSession 模型）                                  │
 └───────────────────────────────────────────┬──────────────────────────────────────────────────┘
                                             │
@@ -69,8 +70,8 @@ presets.<lang>.json（官方原文，13 语言）
 pipeline.interviewRun / interviewStream / examSolveStream / examRun / reportFor
    └─ provider: mock（ai/mockBrain.js，确定性）
                 openai（ai/provider.js，任意 OpenAI 兼容网关，SSE 流式，enable_thinking:false）
-                   · 出题/答案/改写/报告评分 → config.ai.model（qwen3.8-flash）
-                   · 笔试截图 OCR → config.ai.visionModel（qwen3.8-omni-flash，<16px 降级文本）
+                   · 出题/答案/改写/报告评分 → config.ai.model（deepseek-v4.1-flash）
+                   · 笔试截图 OCR → config.ai.visionModel（qwen3.5-omni-flash，<16px 降级文本）
                    · 复盘报告 → LLM rubric 严格 JSON，失败回退 mockBrain.buildReport
 ```
 

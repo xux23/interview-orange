@@ -114,12 +114,15 @@ export default {
       const resume = one('SELECT * FROM resumes WHERE id=? AND user_id=?', resumeId, user.id);
       if (!resume) throw new TRPCError('简历不存在', 'NOT_FOUND');
       const f = resumeFacts(resume);
-      // 真模型：简历 → 3 个匹配岗位
-      const llm = await suggestGoalsFromResume({ resume, facts: f }).catch((e) => {
-        console.warn('[goal.suggest] 模型推荐失败，回退规则:', e.message);
-        return null;
-      });
+      // 真模型：简历 → 3 个匹配岗位；失败直接报错
+      let llm = null;
+      try {
+        llm = await suggestGoalsFromResume({ resume, facts: f });
+      } catch (e) {
+        throw new TRPCError(`岗位推荐失败：${e.message}`, 'INTERNAL_SERVER_ERROR');
+      }
       if (llm?.length) return { resumeId, suggestions: llm, source: 'model' };
+      // mock 模式替身：本地规则推荐
       const suggestions = [
         { name: `${f.role}工程师（${f.techs[0]}）`, companyName: '字节跳动', description: `负责${f.techs.slice(0, 3).join('、')}相关系统研发，要求 3 年以上，熟悉高并发与分布式。` },
         { name: `${f.role}工程师（${f.techs[1] || f.techs[0]}）`, companyName: '美团', description: `业务系统研发，${f.techs.slice(0, 2).join('、')}，重视稳定性与性能优化。` },
@@ -138,20 +141,23 @@ export default {
       let words = fromJson(goal.custom_hot_words, []);
       let source = 'cached';
       if (!words?.length) {
-        // 真模型：从 JD + 简历抽术语（文档 21 §2.4）
+        // 真模型：从 JD + 简历抽术语（文档 21 §2.4）；失败直接报错
         const resume = goal.resume_id
           ? one('SELECT * FROM resumes WHERE id=?', goal.resume_id)
           : one('SELECT * FROM resumes WHERE user_id=? ORDER BY created_at DESC', user.id);
-        const llm = await extractHotWords({ goal, resume }).catch((e) => {
-          console.warn('[hotWords] 模型抽取失败，回退种子:', e.message);
-          return null;
-        });
+        let llm = null;
+        try {
+          llm = await extractHotWords({ goal, resume });
+        } catch (e) {
+          throw new TRPCError(`热词抽取失败：${e.message}`, 'INTERNAL_SERVER_ERROR');
+        }
         if (llm?.customHotWords?.length) {
           words = llm.customHotWords;
           source = 'model';
           run('UPDATE goals SET custom_hot_words=? WHERE id=?', toJson(words), goalId);
           return { goalId, hotWords: llm.hotWords, customHotWords: words, source };
         }
+        // mock 模式替身：种子热词
         words = HOT_WORD_SEED.slice(0, 12);
         source = 'seed';
         run('UPDATE goals SET custom_hot_words=? WHERE id=?', toJson(words), goalId);
@@ -249,14 +255,17 @@ export default {
     handler: async ({ materialId }, { user }) => {
       const m = one('SELECT * FROM materials WHERE id=? AND user_id=?', materialId, user.id);
       if (!m) throw new TRPCError('资料不存在', 'NOT_FOUND');
-      // 真模型：资料 → 问答对
-      const llm = await generateMaterialEntries({ material: m, max: 5 }).catch((e) => {
-        console.warn('[material] 模型生成失败，回退规则:', e.message);
-        return null;
-      });
+      // 真模型：资料 → 问答对；失败直接报错
+      let llm = null;
+      try {
+        llm = await generateMaterialEntries({ material: m, max: 5 });
+      } catch (e) {
+        throw new TRPCError(`问答对生成失败：${e.message}`, 'INTERNAL_SERVER_ERROR');
+      }
       let pairs = llm;
       let source = 'model';
       if (!pairs) {
+        // mock 模式替身：本地规则拆分
         source = 'rule';
         const facts = String(m.content || m.name).split(/[。\n]/).map((s) => s.trim()).filter((s) => s.length > 8).slice(0, 5);
         pairs = (facts.length ? facts : [`关于「${m.name}」的核心背景`]).map((fact) => ({
@@ -298,7 +307,11 @@ export default {
     handler: ({ fileKey, fileName = 'material.txt' }, { user }) => {
       const up = one('SELECT * FROM uploads WHERE key=?', fileKey);
       if (!up) throw new TRPCError('上传文件不存在', 'NOT_FOUND');
-      const text = fs.readFileSync(up.file_path, 'utf8');
+      const buf = fs.readFileSync(up.file_path);
+      const text = extractText(buf, fileName || up.name || '');
+      if (!text || text.trim().length < 10) {
+        throw new TRPCError('文件内容无法解析为文本（图片类暂不支持转为资料）', 'BAD_REQUEST');
+      }
       const mid = cuid();
       run('INSERT INTO materials(id,user_id,name,content,created_at) VALUES(?,?,?,?,?)',
         mid, user.id, fileName.replace(/\.\w+$/, ''), text.slice(0, 60000), nowIso());
@@ -330,11 +343,14 @@ export default {
       success: true,
       key: `local/${cuid(18)}`,
       data: {
-        uploadPrefix: `http://${config.host}:${config.port}/upload`,
+        // 原版 OSS 直传契约：m = `${uploadPrefix}${f}_${p}`，随后 POST 到 endpoint
+        uploadPrefix: 'local/',
+        endpoint: '/upload',
+        uploadEndpoint: '/upload',
         policy: 'local-dev',
         accessKeyId: 'LOCAL',
         signature: 'local-dev-signature',
-        host: `http://${config.host}:${config.port}`,
+        host: '',
         maxFileSize: 20 * 1024 * 1024,
       },
     }),

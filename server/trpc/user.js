@@ -1,9 +1,7 @@
 import { z } from 'zod';
-import { one, run, all } from '../db.js';
+import { one, run } from '../db.js';
 import { fromJson, toJson, nowIso } from '../util.js';
-import { hashPassword, issueToken, verifyToken, bearer } from '../auth.js';
-import { cuid } from '../util.js';
-import { config, isPro } from '../config.js';
+import { config } from '../config.js';
 import { TRPCError } from './errors.js';
 
 const pass = z.object({}).passthrough();
@@ -62,13 +60,14 @@ export function toUserInfo(user) {
     countryCode: user.country_code,
     lastInterviewLang: user.last_interview_lang,
     asset: {
-      subLevel: user.sub_level || 'TRIAL',
-      subExpireAt: user.sub_expire_at,
-      interviewTime: user.interview_time ?? 0,
-      mockInterviewCount: user.mock_interview_count ?? 0,
-      questionPredictionCount: user.question_prediction_count ?? 0,
-      credits: user.credits ?? 0,
-      isPro: isPro(user),
+      // 账号模块已移除：asset 字段仅为 /legacy 原版前端显示兼容
+      subLevel: 'PRO',
+      subExpireAt: null,
+      interviewTime: 9999,
+      mockInterviewCount: 9999,
+      questionPredictionCount: 9999,
+      credits: 0,
+      isPro: true,
     },
     interviewPreference: { ...defaultInterviewPreference(), ...(fromJson(user.interview_preference, {}) || {}) },
     examCustomization: { ...defaultExamCustomization(), ...(fromJson(user.exam_customization, {}) || {}) },
@@ -83,78 +82,31 @@ export function demoUser() {
 }
 
 export default {
+  /* ── 兼容桩（账号模块已移除，token 一律忽略；仅供 /legacy 原版前端与既有测试脚本保持协议形状） ── */
   'user.getTempToken': {
     kind: 'mutation',
     auth: false,
     input: z.object({ phone: z.string().optional(), token: z.string().optional() }).passthrough().optional(),
-    handler: (input) => {
-      const phone = input?.phone;
-      const user = phone ? one('SELECT * FROM users WHERE phone=?', phone) : demoUser();
-      if (!user) throw new TRPCError('用户不存在', 'NOT_FOUND');
-      return { token: issueToken(user.id, 'temp'), expiresIn: 300 };
-    },
+    handler: () => ({ token: 'local', expiresIn: 999999 }),
   },
 
   'user.loginByTempToken': {
     kind: 'mutation',
     auth: false,
     input: z.object({
-      token: z.string(),
+      token: z.string().optional(),
       client: z.enum(['desktop', 'web', 'apply', 'apply-ext']).optional(),
       version: z.string().optional(),
       platform: z.enum(['win32', 'darwin', 'linux']).optional(),
     }).passthrough(),
-    handler: ({ token, client = 'desktop', version = config.version, platform = 'win32' }) => {
-      const payload = verifyToken(token);
-      if (!payload) throw new TRPCError('临时令牌无效或已过期', 'UNAUTHORIZED');
-      const user = one('SELECT * FROM users WHERE id=?', payload.userId);
-      if (!user) throw new TRPCError('用户不存在', 'NOT_FOUND');
-      return { token: issueToken(user.id, 'access'), client, version, platform, user: toUserInfo(user) };
-    },
-  },
-
-  'user.register': {
-    kind: 'mutation',
-    auth: false,
-    input: z.object({ phone: z.string().min(4), password: z.string().min(4).optional() }).passthrough(),
-    handler: ({ phone, password = '' }) => {
-      const exists = one('SELECT * FROM users WHERE phone=?', phone);
-      if (exists) throw new TRPCError('手机号已注册', 'CONFLICT');
-      const id = cuid();
-      run(
-        `INSERT INTO users(id, phone, password_hash, country_code, sub_level, interview_time,
-          mock_interview_count, question_prediction_count, credits, interview_preference,
-          exam_customization, client_settings, created_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        id, phone, hashPassword(password), 'CN', 'TRIAL', 3, 1, 1, 0,
-        toJson(defaultInterviewPreference()), toJson(defaultExamCustomization()), toJson(defaultClientSettings()), nowIso(),
-      );
-      run('INSERT INTO voiceprints(user_id, enrolled, status) VALUES(?,0,?)', id, 'available');
-      return { token: issueToken(id, 'access'), user: toUserInfo(one('SELECT * FROM users WHERE id=?', id)) };
-    },
-  },
-
-  'user.login': {
-    kind: 'mutation',
-    auth: false,
-    input: z.object({ phone: z.string(), password: z.string().optional() }).passthrough(),
-    handler: ({ phone, password = '' }) => {
-      const user = one('SELECT * FROM users WHERE phone=?', phone);
-      if (!user) throw new TRPCError('账号不存在', 'NOT_FOUND');
-      if (user.password_hash && user.password_hash !== hashPassword(password)) {
-        throw new TRPCError('密码不正确', 'UNAUTHORIZED');
-      }
-      return { token: issueToken(user.id, 'access'), user: toUserInfo(user) };
-    },
+    handler: ({ client = 'desktop', version = config.version, platform = 'win32' }) =>
+      ({ token: 'local', client, version, platform, user: toUserInfo(demoUser()) }),
   },
 
   'user.refreshToken': {
     kind: 'mutation',
     input: pass.optional(),
-    handler: (_input, { user }) => {
-      const iat = Math.floor(Date.now() / 1000);
-      return { token: issueToken(user.id, 'access'), refreshedAt: nowIso(), iat };
-    },
+    handler: () => ({ token: 'local', refreshedAt: nowIso(), iat: Math.floor(Date.now() / 1000) }),
   },
 
   'user.getUserInfo': {

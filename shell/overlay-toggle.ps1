@@ -1,4 +1,4 @@
-<#
+﻿<#
  * 浮窗显示/隐藏（panic 等价物）：主窗崩溃或需要紧急隐藏时用。
  *   powershell -File shell\overlay-toggle.ps1 -Hide
  *   powershell -File shell\overlay-toggle.ps1 -Show

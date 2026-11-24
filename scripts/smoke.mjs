@@ -59,8 +59,12 @@ async function main() {
     audioSource: 'MICROPHONE', round: 'FIRST', metadata: { assistMode: true, difficulty: '3_5_YEARS', lang: 'zh-CN' },
   }, token);
   ok('createSession', session.id);
-  const missingAuth = await call('session.getSessions', 'query', {}, '').catch((e) => e.message);
-  ok('unauthorizedGuard', String(missingAuth));
+  const localProfile = await call('session.getSessions', 'query', {}, '').catch((e) => e.message);
+  if (typeof localProfile === 'object' && Number.isFinite(localProfile.total)) {
+    ok('localProfile', `total=${localProfile.total}`);
+  } else {
+    fail('localProfile', String(localProfile));
+  }
 
   // 5) 面试 socket（root namespace）
   const eventCounts = {};
@@ -91,7 +95,18 @@ async function main() {
   socket.disconnect();
   const completed = await call('session.completeSession', 'mutation', { id: session.id }, token);
   const report = await call('session.getSessionReport', 'query', { id: session.id }, token);
-  ok('report', `status=${completed.status} score=${report.score} grade=${report.grade}`);
+  const summary = report?.interviewSummary || {};
+  const dimensions = Array.isArray(summary.fiveDimensions) ? summary.fiveDimensions : [];
+  const analysis = Array.isArray(report?.conversationAnalysis) ? report.conversationAnalysis : [];
+  const reportOk = Number.isFinite(Number(report?.score))
+    && dimensions.length === 5
+    && Boolean(summary.interviewSummary)
+    && analysis.length > 0;
+  if (reportOk) {
+    ok('report', `status=${completed.status} score=${report.score} dimensions=${dimensions.length} summary=${summary.interviewSummary.length}字 conversations=${analysis.length}`);
+  } else {
+    fail('report.schema', `score=${report?.score} dimensions=${dimensions.length} summary=${Boolean(summary.interviewSummary)} conversations=${analysis.length}`);
+  }
 
   // 7) 笔试 socket（/desktop）
   const desk = io(`${BASE}/desktop`, { auth: { token, locale: 'zh' }, transports: ['websocket'], reconnection: false });
