@@ -140,6 +140,15 @@ fn diag_box(msg: String) {
 
 fn main() {
     tauri::Builder::default()
+        // P1-11：窗口销毁时移除 hwnd 登记（否则 panic/伪装会遍历到失效句柄）
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let label = window.label().to_string();
+                let state = window.state::<std::sync::Arc<std::sync::Mutex<win::AppState>>>();
+                win::remove_hwnd(&state, &label);
+                println!("[native] 窗口已销毁并从登记移除：{label}");
+            }
+        })
         .on_page_load(|webview, payload| {
             println!("[page] {} → {}", webview.label(), payload.url());
         })
@@ -518,6 +527,11 @@ fn open_new_window(
     .on_new_window(move |u, f| open_new_window(&h, wv.clone(), u, f));
     match builder.build() {
         Ok(w) => {
+            // P1-11：房间窗（web-*）也必须登记 hwnd，panic/伪装/任务栏/最小化/close 才能覆盖
+            if let Ok(hwnd) = w.hwnd() {
+                let st = handle.state::<std::sync::Arc<std::sync::Mutex<win::AppState>>>();
+                win::set_hwnd(&st, &label, hwnd.0 as isize);
+            }
             println!("[native] 新窗口 {label} → {url}");
             tauri::webview::NewWindowResponse::Create { window: w }
         }

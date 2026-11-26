@@ -61,9 +61,9 @@ export default {
       visionModel: z.string().optional(),
       temperature: z.number().min(0).max(2).optional(),
     }).passthrough(),
-    handler: (input) => {
+    handler: async (input) => {
       try {
-        return saveAI(input);
+        return await saveAI(input);
       } catch (e) {
         throw new TRPCError(e.message, 'BAD_REQUEST');
       }
@@ -112,9 +112,9 @@ export default {
       silenceGateMs: z.number().int().min(200).max(6000).optional(),
       maxUtteranceMs: z.number().int().min(1000).max(120000).optional(),
     }).passthrough(),
-    handler: (input) => {
+    handler: async (input) => {
       try {
-        return saveASR(input);
+        return await saveASR(input);
       } catch (e) {
         throw new TRPCError(e.message, 'BAD_REQUEST');
       }
@@ -172,16 +172,29 @@ export default {
       const provider = config.ai.provider;
       if (input.scene === 'exam') {
         const { examRun } = await import('../ai/pipeline.js');
+        const started = Date.now();
         const res = await examRun({
+          userId: user.id,
+          resumeId: input.resumeId,
+          goalId: input.goalId,
+          materialIds: input.materialIds,
           questionText: input.question || '',
           presetSlug: input.examPresetSlug,
           mode: input.mode,
           lang: input.lang || 'zh-CN',
+          // P2-A：customization 真正传给提示词（此前完全没用到）
+          customization: {
+            ...(input.customization || {}),
+            codeQuality: input.answerStyle || input.mode || 'standard',
+            customStyle: input.customStyle || '',
+          },
         });
+        const totalMs = Date.now() - started;
         return {
           scene: 'exam', systemPrompt: res.systemPrompt, answer: res.answer,
-          ttftMs: 900, totalMs: 2600, error: null, answerLang: null,
-          caseTitle: input.examPresetSlug || null, knowledge: null,
+          // P2-A：非流式接口无法单独测首 token，ttft 与总耗时同值（实测而非硬编码）
+          ttftMs: totalMs, totalMs, error: null, answerLang: null,
+          caseTitle: input.examPresetSlug || null, knowledge: res.knowledge || null,
         };
       }
       const res = await interviewRun({

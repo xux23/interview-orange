@@ -8,6 +8,7 @@
 import { io } from 'socket.io-client';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { trpcHeaders, socketAuth } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22,7 +23,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json();
@@ -67,7 +68,7 @@ const ev = { seq: [] }; // 官方事件序列（时间序）
 const answer = { chunks: [], started: 0, ended: 0 };
 const segs = { 'Guest-1': [], self: [] };
 let aiErrors = [];
-const s = io(BASE, { auth: { token, locale: 'zh', sessionId: session.id }, transports: ['websocket'], reconnection: false });
+const s = io(BASE, { auth: socketAuth({ token, locale: 'zh', sessionId: session.id }), transports: ['websocket'], reconnection: false });
 const seen = (name) => { ev.seq.push(name); };
 s.on('audio.permission', (p) => { if (p.canSendAudio) seen('audio.permission.true'); });
 s.on('stt.pending', (p) => { if (p.speakerId) seen(`stt.pending:${p.speakerId}`); });

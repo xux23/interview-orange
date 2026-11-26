@@ -6,6 +6,7 @@
  * 运行：node scripts/p0p1-verify.mjs   （provider=openai 才有效）
  */
 import fs from 'node:fs';
+import { trpcHeaders } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 const results = [];
@@ -18,7 +19,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json();

@@ -1,0 +1,238 @@
+[
+  {
+    "kind": "text",
+    "model": "qwen3.8-flash",
+    "ping": {
+      "ttftMs": 455,
+      "totalMs": 493
+    },
+    "answer": {
+      "ttftMs": 436,
+      "totalMs": 4207,
+      "chars": 674,
+      "charsPerSec": "179"
+    },
+    "sample": "MySQL 选择 B+ 树而非 B 树作为索引结构，主要基于以下核心优势： 1. **磁盘 I/O 次数更少** - **非叶子节点不存数据**：B+ 树的非叶子节点只存储键值和指针，不存储实际数据。这使得单个节点能容纳更多的键值，从而降低",
+    "usage": {
+      "prompt_tokens": 45,
+      "total_tokens": 434,
+      "completion_tokens": 389,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "text_tokens": 45
+      }
+    }
+  },
+  {
+    "kind": "text",
+    "model": "qwen3.7-flash",
+    "ping": {
+      "ttftMs": 338,
+      "totalMs": 396
+    },
+    "answer": {
+      "ttftMs": 198,
+      "totalMs": 4606,
+      "chars": 599,
+      "charsPerSec": "136"
+    },
+    "sample": "MySQL InnoDB 引擎选择 B+ 树而非 B 树作为索引结构，主要基于以下核心优势： 1. **磁盘 I/O 次数更少（更矮胖）** - B+ 树的非叶子节点仅存储键值（Key），不存储数据（Data），因此单个节点能容纳更多的索引",
+    "usage": {
+      "prompt_tokens": 45,
+      "total_tokens": 383,
+      "completion_tokens": 338,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "text_tokens": 45
+      }
+    }
+  },
+  {
+    "kind": "text",
+    "model": "qwen3.7-plus",
+    "ping": {
+      "ttftMs": 784,
+      "totalMs": 921
+    },
+    "answer": {
+      "ttftMs": 628,
+      "totalMs": 7073,
+      "chars": 684,
+      "charsPerSec": "106"
+    },
+    "sample": "MySQL（InnoDB 引擎）选择 B+ 树而非 B 树作为索引结构，主要基于以下四个核心优势： 1. **磁盘 I/O 次数更少（查询性能更稳定）** - **B+ 树**：非叶子节点只存储键值（Key）和指针，不存储数据。因此单个节点",
+    "usage": {
+      "prompt_tokens": 45,
+      "total_tokens": 445,
+      "completion_tokens": 400,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "text_tokens": 45
+      }
+    }
+  },
+  {
+    "kind": "text",
+    "model": "qwen3.8-max",
+    "ping": {
+      "ttftMs": 654,
+      "totalMs": 724
+    },
+    "answer": {
+      "ttftMs": 905,
+      "totalMs": 8790,
+      "chars": 678,
+      "charsPerSec": "86"
+    },
+    "sample": "# MySQL 为什么用 B+ 树而不是 B 树做索引？ 核心原因围绕 **磁盘 I/O 效率** 和 **查询场景适配**，分以下几点： --- ## 1. 非叶子节点不存数据，扇出更大，树更矮 - **B 树**：每个节点都存储 key",
+    "usage": {
+      "prompt_tokens": 45,
+      "total_tokens": 445,
+      "completion_tokens": 400,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "text_tokens": 45
+      }
+    }
+  },
+  {
+    "kind": "text",
+    "model": "deepseek-v4.1-flash",
+    "ping": {
+      "ttftMs": 362,
+      "totalMs": 421
+    },
+    "answer": {
+      "ttftMs": 442,
+      "totalMs": 2521,
+      "chars": 559,
+      "charsPerSec": "269"
+    },
+    "sample": "# MySQL 为什么用 B+ 树而不是 B 树 ## 1. 磁盘 IO 次数更少（核心原因） - B+ 树非叶子节点只存键、不存数据，同样大小的页能容纳更多键，**树更矮**。 - 树高通常 3~4 层即可支撑千万级数据，一次查询只需 3",
+    "usage": {
+      "prompt_tokens": 33,
+      "total_tokens": 392,
+      "completion_tokens": 359,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "image_tokens": 0,
+        "text_tokens": 33
+      },
+      "completion_tokens_details": {
+        "text_tokens": 359
+      }
+    }
+  },
+  {
+    "kind": "text",
+    "model": "glm-5.3",
+    "error": "HTTP 400: data: {\"error\":{\"code\":\"invalid_parameter_error\",\"param\":null,\"message\":\"The value of the enable_thinking parameter is restricted to True.\",\"type\":\"invalid_requ"
+  },
+  {
+    "kind": "text",
+    "model": "kimi-k3",
+    "ping": {
+      "ttftMs": 1319,
+      "totalMs": 1518
+    },
+    "answer": {
+      "ttftMs": 1444,
+      "totalMs": 12653,
+      "chars": 675,
+      "charsPerSec": "60"
+    },
+    "sample": "MySQL 选择 B+ 树而非 B 树作为索引结构，主要基于以下核心原因： ## 1. 磁盘 I/O 效率更高（核心原因） - **B 树**：每个节点既存键值（Key）也存数据（Data），导致单个节点能容纳的键值数量有限 - **B+ ",
+    "usage": null
+  },
+  {
+    "kind": "text",
+    "model": "MiniMax-M3.1-Flash",
+    "error": "HTTP 404: {\"error\":{\"message\":\"Model not exist.\",\"id\":\"073a3bae-c0aa-94ac-a236-de97bda49b21\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}"
+  },
+  {
+    "kind": "text",
+    "model": "MiniMax/MiniMax-M3.1-Flash",
+    "ping": {
+      "ttftMs": null,
+      "totalMs": 1101
+    },
+    "answer": {
+      "ttftMs": null,
+      "totalMs": 5695,
+      "chars": 0,
+      "charsPerSec": "0"
+    },
+    "sample": "",
+    "usage": null
+  },
+  {
+    "kind": "vision",
+    "model": "qwen3.8-omni-flash",
+    "ttftMs": 556,
+    "totalMs": 1826,
+    "chars": 157,
+    "sample": "笔试访问 预设 算法编程·反转单链表（编程模式） 模式 quick 截取屏幕 清空截图 或粘贴题面（无截图时） 例如：求两数之和的下标... 解题（扣2分钟） 每次截图解题按官方口径扣2分钟；结果同步到浮窗。 session: — 结束并关闭 待解题 reqId: — 还没有答案：先截图或粘贴题面，"
+  },
+  {
+    "kind": "vision",
+    "model": "qwen3.5-omni-flash",
+    "ttftMs": 286,
+    "totalMs": 679,
+    "chars": 157,
+    "sample": "笔试房间 预设 算法编程·反转单链表（编程模式） 模式 quick 截取屏幕 清空截图 或粘贴题面（无截图时） 例如：求两数之和的下标... 解题（扣2分钟） 每次截图解题按官方口径扣2分钟；结果同步到浮窗。 待解题 reqId: — 还没有答案：先截图或粘贴题面，再点「解题」。 session: "
+  },
+  {
+    "kind": "vision",
+    "model": "qwen3.5-omni-plus",
+    "ttftMs": 585,
+    "totalMs": 1804,
+    "chars": 163,
+    "sample": "笔试房间 预设 算法编程 - 反转单链表（编程模式） 模式 quick 截取屏幕 清空截图 或粘贴题面（无截图时） 例如：求两数之和的下标... 解题（扣 2 分钟） 每次截图解题按官方口径扣 2 分钟；结果同步到浮窗。 session: - 结束并关闭 待解题 reqId: — 还没有答案：先截图"
+  },
+  {
+    "kind": "vision",
+    "model": "qwen3-vl-plus",
+    "ttftMs": 683,
+    "totalMs": 2832,
+    "chars": 185,
+    "sample": "笔试房间 预设 算法编程·反转单链表（编程模式） 模式 quick 截取屏幕 清空截图 或粘贴题面（无截图时） 例如：求两数之和的下标... 解题（扣2分钟） 每次截图解题按官方口径扣2分钟；结果同步到浮窗。 session：－ 结束并关闭 待解题 reqId：— 还没有答案：先截图或粘贴题面，再点"
+  },
+  {
+    "kind": "solve",
+    "model": "qwen3.8-omni-flash",
+    "ttftMs": 664,
+    "totalMs": 9447,
+    "chars": 1312,
+    "sample": "## 一、题目分析 给定数组 `nums` 和目标值 `target`，找出和为 `target` 的两个元素的下标。 示例：`nums = [2,7,11,15]`, `target = 9` → `[0,1]`（因为 `2+7=9`） --- ## 二、思路与 O(n) 解法 —— 哈希表 ### 💡 核心思想 遍历数组时，对于当前元素 `num`，计算它的**互补数** `complement = target - num`，然后去哈希表中查找这个互补数是否已经出现过。若存在，则返回两个下标；否则将当前元素及其下标存入哈希表。 > **本质**：用空间换时间，把\"两数之和\"问题转化为一"
+  },
+  {
+    "kind": "solve",
+    "model": "qwen3.5-omni-flash",
+    "ttftMs": 343,
+    "totalMs": 2978,
+    "chars": 1269,
+    "sample": "这是一个经典的“两数之和”问题，我们分两部分解答： --- ## ✅ 第一部分：未排序数组，要求 O(n) 时间复杂度 ### 🧠 思路： 使用**哈希表（字典）**来存储已遍历过的数字及其下标。 对于当前元素 `nums[i]`，我们计算它需要的补数 `complement = target - nums[i]`。 如果这个补数已经在哈希表中，说明找到了两个数，返回它们的下标； 否则，将当前数字和它的下标存入哈希表，继续遍历。 这样只需一次遍历，时间复杂度为 **O(n)**，空间复杂度也为 **O(n)**。 > ⚠️ 注意：题目只要求返回下标，不要求排序或去重，且保证有唯一解（根据示例"
+  },
+  {
+    "kind": "solve",
+    "model": "qwen3.5-omni-plus",
+    "ttftMs": 959,
+    "totalMs": 7805,
+    "chars": 1171,
+    "sample": "我们来逐步解答这个问题。 --- ## 🎯 题目要求： 给定整数数组 `nums` 和目标值 `target`，找出**两个元素的下标**，使得它们的和等于 `target`。返回这两个下标（顺序不限）。 示例： `nums = [2, 7, 11, 15], target = 9` → 返回 `[0, 1]` 要求： - 给出思路 - 提供 **O(n)** 时间复杂度的 Python 代码 - 追问：如果数组已排序，如何用 **O(1) 空间** 解决？ --- # ✅ 第一部分：通用情况（未排序数组）—— O(n) 时间 + O(n) 空间 ## 💡 思路： 使用**哈希表（字典）*"
+  },
+  {
+    "kind": "solve",
+    "model": "qwen3-vl-plus",
+    "ttftMs": 491,
+    "totalMs": 9484,
+    "chars": 1185,
+    "sample": "我们来逐步分析这个问题。 --- ### 📌 题目要求 给定一个整数数组 `nums` 和一个目标值 `target`，找出**两个元素之和等于 `target` 的下标**，并返回这两个下标（顺序不限，但示例返回 `[0, 1]`，即较小下标在前？注意：示例中 `nums[0]=2`, `nums[1]=7`, `2+7=9=target`）。 要求： - 时间复杂度：**O(n)** - 空间复杂度：**O(n)**（常规解法） - **追问**：如果数组已排序，如何用 **O(1) 空间** 解决？ --- ## ✅ 思路一：哈希表法（通用 O(n) 时间 + O(n) 空间） 遍历数"
+  },
+  {
+    "kind": "asr",
+    "model": "qwen3.8-omni-flash",
+    "ms": 2623,
+    "text": "欢迎大家来体验达摩院推出的语音识别模型。"
+  }
+]

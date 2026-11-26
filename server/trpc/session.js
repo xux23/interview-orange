@@ -37,11 +37,11 @@ export async function finalizeSession(sessionId, userId) {
   if (!row) return null;
   if (row.status === 'COMPLETED') return sessionDto(row);
   if (finalizing.has(sessionId)) {
-    // 已在生成中：等它落库（报告生成可能要数秒）
+    // 已在生成中：等它落库（成功 COMPLETED / 失败 FAILED 都算收尾完成）
     for (let i = 0; i < 100; i++) {
       await new Promise((r) => setTimeout(r, 300));
       const cur = one('SELECT * FROM sessions WHERE id=?', sessionId);
-      if (cur?.status === 'COMPLETED') return sessionDto(cur);
+      if (cur?.status === 'COMPLETED' || cur?.status === 'FAILED') return sessionDto(cur);
     }
     return sessionDto(one('SELECT * FROM sessions WHERE id=?', sessionId));
   }
@@ -58,6 +58,13 @@ export async function finalizeSession(sessionId, userId) {
       run('UPDATE users SET mock_interview_count = MAX(0, mock_interview_count - 1) WHERE id=?', userId);
     }
     return sessionDto(one('SELECT * FROM sessions WHERE id=?', sessionId));
+  } catch (e) {
+    // P1-6：报告失败必须落明确终态（FAILED + report.error），不能静默留在 ACTIVE；
+    // 保留 retry 路径（retrySessionReport 会重新调用本函数，成功后置 COMPLETED）
+    const at = nowIso();
+    run('UPDATE sessions SET status=?, updated_at=?, report=? WHERE id=?',
+      'FAILED', at, toJson({ status: 'failed', error: { message: e?.message || String(e), at } }), sessionId);
+    throw e;
   } finally {
     finalizing.delete(sessionId);
   }
@@ -78,6 +85,7 @@ export function sessionDto(row, { withMessages = true } = {}) {
     tokenUsage: fromJson(row.token_usage, null),
     report: (() => { const r = fromJson(row.report, null); return r ? { status: r.status || 'success' } : (row.status === 'COMPLETED' ? { status: 'pending' } : null); })(),
     reportReady: (() => { const r = fromJson(row.report, null); return !!r && (r.status === 'success' || r.status === 'READY'); })(),
+    reportError: (() => { const r = fromJson(row.report, null); return r?.error || null; })(),
     experience: fromJson(row.experience, null),
     goalId: row.goal_id,
     resumeId: row.resume_id,
@@ -305,7 +313,8 @@ export default {
       let report = fromJson(row.report, null);
       if (!report) {
         if (row.status !== 'COMPLETED') return { status: 'pending', sessionId: id };
-        const ctx = buildContext(user.id, { resumeId: row.resume_id, goalId: row.goal_id });
+        // P2-A：与 finalizeSession 保持一致，资料也参与报告生成的上下文
+        const ctx = buildContext(user.id, { resumeId: row.resume_id, goalId: row.goal_id, materialIds: fromJson(row.metadata, {})?.materialIds });
         // P1-11：走单飞生成，避免与 finalizeSession/并发请求重复调用模型
         report = await generateReportOnce(id, row, ctx);
       }
@@ -316,9 +325,17 @@ export default {
   'session.retrySessionReport': {
     kind: 'mutation',
     input: z.object({ id: z.string() }).passthrough(),
-    handler: ({ id }, { user }) => {
-      run('UPDATE sessions SET report=NULL WHERE id=? AND user_id=?', id, user.id);
-      return { id, queued: true };
+    handler: async ({ id }, { user }) => {
+      const row = one('SELECT * FROM sessions WHERE id=? AND user_id=?', id, user.id);
+      if (!row) throw new TRPCError('会话不存在', 'NOT_FOUND');
+      // P1-6：重试 = 清掉旧报告后重跑 finalizeSession（成功后置 COMPLETED），失败显式报错
+      run('UPDATE sessions SET report=NULL WHERE id=?', id);
+      try {
+        const dto = await finalizeSession(id, user.id);
+        return { id, queued: true, status: dto?.status || null, reportReady: Boolean(dto?.reportReady) };
+      } catch (e) {
+        throw new TRPCError(`报告重试失败：${e.message}`, 'INTERNAL_SERVER_ERROR');
+      }
     },
   },
 

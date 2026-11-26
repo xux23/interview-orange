@@ -3,6 +3,7 @@
  * 运行：node scripts/smoke.mjs
  */
 import { io } from 'socket.io-client';
+import { trpcHeaders, socketAuth } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 const results = [];
@@ -15,7 +16,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json();
@@ -68,7 +69,7 @@ async function main() {
 
   // 5) 面试 socket（root namespace）
   const eventCounts = {};
-  const socket = io(BASE, { auth: { token, locale: 'zh', sessionId: session.id }, transports: ['websocket'], reconnection: false });
+  const socket = io(BASE, { auth: socketAuth({ token, locale: 'zh', sessionId: session.id }), transports: ['websocket'], reconnection: false });
   const question = [];
   const answer = [];
   socket.on('mock.question', (c) => question.push(c));
@@ -109,7 +110,7 @@ async function main() {
   }
 
   // 7) 笔试 socket（/desktop）
-  const desk = io(`${BASE}/desktop`, { auth: { token, locale: 'zh' }, transports: ['websocket'], reconnection: false });
+  const desk = io(`${BASE}/desktop`, { auth: socketAuth({ token, locale: 'zh' }), transports: ['websocket'], reconnection: false });
   await new Promise((r) => setTimeout(r, 800));
   const dconn = desk.connected;
   if (!dconn) fail('desktop.connect');

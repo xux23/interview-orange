@@ -92,8 +92,8 @@ export default function OverlayWindow({ user }) {
     const g = createOverlayGate({
       onActivate: (state) => {
         const prev = sessionRef.current;
-        // 新会话必须清掉上一场残留的卡片；同一会话重新显示时保留
-        if (state.sessionId && state.sessionId !== prev) setCards([]);
+        // P1-8：新会话清掉上一场残留（卡片 + 流式轮次 + 临时态）；同一会话重新显示时保留
+        if (state.sessionId && state.sessionId !== prev) resetSessionState();
         setGate({ ...state });
         // 打开/预览时携带的样式立即应用（只取已知键，过滤 width/height 等非样式字段）
         if (state.style && typeof state.style === 'object') {
@@ -114,10 +114,16 @@ export default function OverlayWindow({ user }) {
         try { persisted = JSON.parse(localStorage.getItem('overlay.session') || 'null'); } catch { persisted = null; }
         const rejoin = state.sessionId || prev || persisted?.sessionId || null;
         sessionRef.current = rejoin;
-        if (state.sessionId) {
+        // P1-7：同一 sessionId 且连接仍在时直接复用，不做断流重连（流式轮次不会丢）
+        const reusable = Boolean(state.sessionId)
+          && socketRef.current
+          && socketRef.current.connected
+          && connectedSidRef.current === state.sessionId;
+        const alive = Boolean(socketRef.current && socketRef.current.connected);
+        if (state.sessionId && !reusable) {
           connect(state.sessionId);
-        } else if (rejoin && !socketRef.current && (state.mode === 'interview' || state.mode === 'exam')) {
-          // 热键召回的无 sessionId shown：socket 若已断，按持久化会话重连
+        } else if (!state.sessionId && rejoin && !alive && (state.mode === 'interview' || state.mode === 'exam')) {
+          // 热键召回的无 sessionId shown：socket 已断才按持久化会话重连
           connect(rejoin);
         }
         // P0-2：预览态只在「确实从有会话切到预览」时清卡片，窗口重新显示不再清
@@ -188,6 +194,18 @@ export default function OverlayWindow({ user }) {
   const streamRef = useRef(null);
   const [streamView, setStreamView] = useState(null);
   const qidSeq = useRef(0);
+  const connectedSidRef = useRef(null);
+
+  /* P1-8：切换会话时不仅清卡片，还要复位流式轮次与运行态，
+   * 否则新会话首个 questionStart 会把上一场残留轮次提交进新会话。 */
+  function resetSessionState() {
+    setCards([]);
+    streamRef.current = null;
+    setStreamView(null);
+    qidSeq.current = 0;
+    setInject('');
+    setExam({ active: false, reqId: null, reasoning: '', answer: '' });
+  }
 
   function connect(sessionId) {
     disconnect();
@@ -197,6 +215,7 @@ export default function OverlayWindow({ user }) {
       transports: ['websocket', 'polling'],
     });
     socketRef.current = socket;
+    connectedSidRef.current = sessionId;
 
     const touch = () => setStreamView(streamRef.current ? { ...streamRef.current } : null);
     const beginStream = (prefix) => {
@@ -276,6 +295,7 @@ export default function OverlayWindow({ user }) {
       socketRef.current.disconnect();
       socketRef.current = null;
     }
+    connectedSidRef.current = null;
   }
 
   const injectQuestion = () => {

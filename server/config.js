@@ -31,8 +31,8 @@ const num = (v, def, min = 1, max = Number.MAX_SAFE_INTEGER) => {
 };
 
 export const config = {
-  version: 'interview-orange/1.0.0',
-  appVersion: '1.0.0',
+  version: 'interview-orange/1.1.0',
+  appVersion: '1.1.0',
   port: num(env.ML_PORT, 8756, 1, 65535),
   host: env.ML_HOST || '127.0.0.1',
   dataDir: path.resolve(root, env.ML_DATA_DIR || 'data'),

@@ -237,6 +237,7 @@ ML_ASR_MODEL=qwen3.5-omni-flash        # 语音转写（2026-11-24 复测：~0.7
 优先级：设置页覆盖 > `.env` > 出厂默认；`/healthz` 用 `providerSource` / `asrSource`（`settings` / `env`）标明来源。
 自检专项：`npm run test:ai`（`scripts/ai-config-e2e.mjs` 15/15）+ `npm run test:asr`
 （`scripts/asr-config-e2e.mjs` 15/15：假音频网关、input_audio 真转写、热切换、越界校验、回退替身）。
+运行口径：两套自检需先以 `ML_ALLOW_LOCAL_GATEWAY=1 node server/index.js` 启动服务（放行指向 127.0.0.1 假网关，默认关闭，不影响 SSRF 安全默认值）。
 
 ## 独立环境的含义
 

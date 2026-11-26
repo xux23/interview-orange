@@ -156,35 +156,44 @@ export async function* examSolveStream({ userId, questionText, screenshotPath, p
     await task;
     if (err && emitted === 0) throw err;
     if (emitted === 0) throw new Error('上游模型无输出');
-    if (err) console.warn(`[exam] 流式尾部出错（已输出 ${emitted} 段，保留部分答案）:`, err.message);
+    // P2-A：尾部错误不得当成功——抛给 socket 层走 exam.error，已输出内容仅作展示、不扣时/不落库
+    if (err) throw err;
     return;
   }
 
   const r = examAnswer({ questionText, preset, mode, screenshot: Boolean(screenshotPath) });
+  // P1-9：mock 路径也响应 exam.abort（否则中止后流仍跑完、服务端忙锁迟迟不释放）
   for (let i = 0; i < r.reasoning.length; i += 12) {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { aborted: true });
     yield { type: 'reasoning', text: r.reasoning.slice(i, i + 12) };
     await pause(12);
   }
   for (let i = 0; i < r.answer.length; i += 4) {
+    if (signal?.aborted) throw Object.assign(new Error('aborted'), { aborted: true });
     yield { type: 'delta', text: r.answer.slice(i, i + 4) };
     await pause(14);
   }
 }
 
 /** 非流式笔试答题（promptStudio.run 的 exam 场景等价物） */
-export async function examRun({ questionText, presetSlug, mode = 'quick', customization, lang = 'zh-CN' }) {
+export async function examRun({ userId, resumeId, goalId, materialIds, questionText, presetSlug, mode = 'quick', customization, lang = 'zh-CN' }) {
   const preset = presetSlug ? examPreset(presetSlug, lang) : null;
   const systemPrompt = buildExamSystemPrompt({ lang, preset, customization, styleValue: customization?.codeQuality || 'standard' });
+  // P2-A：真正使用岗位/简历/资料（此前只透传题面），拼进题目上下文
+  const ctx = userId ? buildContext(userId, { resumeId, goalId, materialIds }) : { resume: null, goal: null, materials: [] };
+  const knowledge = buildKnowledge(ctx.materials);
+  const contextLines = [
+    ctx.goal?.name ? `岗位：${ctx.goal.name}` : '',
+    ctx.resume ? `简历摘要：${String(ctx.resume.content || ctx.resume.title || '').slice(0, 800)}` : '',
+    knowledge ? `知识库（节选）：\n${knowledge.content.slice(0, 4000)}` : '',
+  ].filter(Boolean).join('\n');
+  const userContent = `题目：${questionText || '（未提供题目）'}\n模式：${mode}${contextLines ? `\n${contextLines}` : ''}`;
   if (providerName() === 'openai') {
-    const r = await openaiComplete({
-      system: systemPrompt,
-      messages: [{ role: 'USER', content: `题目：${questionText || '（未提供题目）'}\n模式：${mode}` }],
-      maxTokens: 1200,
-    });
-    return { answer: r.text, systemPrompt, provider: providerName() };
+    const r = await openaiComplete({ system: systemPrompt, messages: [{ role: 'USER', content: userContent }], maxTokens: 1200 });
+    return { answer: r.text, systemPrompt, provider: providerName(), knowledge };
   }
   const r = examAnswer({ questionText, preset, mode });
-  return { answer: r.answer, systemPrompt, provider: providerName() };
+  return { answer: r.answer, systemPrompt, provider: providerName(), knowledge };
 }
 
 /** mock 面试官下一题 */

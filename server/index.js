@@ -61,23 +61,15 @@ const sendError = (res, err) => {
 };
 
 // 高危3：每次启动生成的随机 socket 握手 token（写入数据目录，经页面注入下发给自家 UI；/healthz 不再返回）
+// 注意：token 只在此生成；落盘（writeFileSync）推迟到 server.listen 成功回调里执行，
+// 避免 EADDRINUSE 崩溃时把磁盘 token 覆盖成死进程的值。
 const socketToken = crypto.randomBytes(24).toString('hex');
-try {
-  fs.writeFileSync(path.join(config.dataDir, '.socket-token'), socketToken, { mode: 0o600 });
-} catch (e) {
-  console.warn('[boot] socket token 文件写入失败:', e.message);
-}
 
 /* ── P0-3：tRPC / 上传的本地调用凭证 ──
  * 账号体系已移除（单用户本地档案），但任何本机网页/进程都不该能直接读写 API：
  * 启动生成随机 apiToken，写入数据目录 + 注入自家页面（window.__ML_ENV__）+ SameSite=Strict
  * HttpOnly cookie；/trpc 与 /upload 必须携带（header 或 cookie），否则 401。 */
 const apiToken = crypto.randomBytes(32).toString('hex');
-try {
-  fs.writeFileSync(path.join(config.dataDir, '.api-token'), apiToken, { mode: 0o600 });
-} catch (e) {
-  console.warn('[boot] api token 文件写入失败:', e.message);
-}
 
 const TOKEN_COOKIE = 'ml_token';
 function parseCookies(header) {
@@ -531,6 +523,17 @@ const server = http.createServer(app);
 attachSocket(server, { socketToken });
 
 server.listen(config.port, config.host, () => {
+  // 绑定端口成功后才落盘，避免 EADDRINUSE 崩溃时覆盖旧实例的 token
+  try {
+    fs.writeFileSync(path.join(config.dataDir, '.socket-token'), socketToken, { mode: 0o600 });
+  } catch (e) {
+    console.warn('[boot] socket token 文件写入失败:', e.message);
+  }
+  try {
+    fs.writeFileSync(path.join(config.dataDir, '.api-token'), apiToken, { mode: 0o600 });
+  } catch (e) {
+    console.warn('[boot] api token 文件写入失败:', e.message);
+  }
   const base = `http://${config.host}:${config.port}`;
   console.log(`\n面试橙（独立环境）已启动`);
   console.log(`  主工作台 : ${base}/#main`);

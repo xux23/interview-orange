@@ -4,6 +4,7 @@
  */
 import http from 'node:http';
 import { io } from 'socket.io-client';
+import { trpcHeaders, socketAuth } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 const UPSTREAM = Number(process.env.UPSTREAM_PORT || 8799);
@@ -21,7 +22,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json().catch(() => ({}));
@@ -135,7 +136,7 @@ async function main() {
   const session = await call('session.createSession', 'mutation', {
     type: 'MOCK_INTERVIEW', audioSource: 'MICROPHONE', round: 'FIRST', metadata: { assistMode: true, lang: 'zh-CN' },
   }, token);
-  const sock = io(BASE, { auth: { token, locale: 'zh', sessionId: session.id }, transports: ['websocket'], reconnection: false });
+  const sock = io(BASE, { auth: socketAuth({ token, locale: 'zh', sessionId: session.id }), transports: ['websocket'], reconnection: false });
   const chunks = [];
   sock.on('ai.message', (c) => chunks.push(c));
   await new Promise((r) => setTimeout(r, 700));
@@ -177,6 +178,9 @@ async function main() {
 
 main().catch(async (e) => {
   console.error('[e2e] 失败：', e);
+  if (String(e?.message || e).includes('不能指向内网/本机/链路本地地址')) {
+    console.error('提示：自检需要本地假网关，请用 `ML_ALLOW_LOCAL_GATEWAY=1 node server/index.js` 启动服务后重跑');
+  }
   process.exitCode = 1;
   try { process.exit(1); } catch { /* ignore */ }
 });

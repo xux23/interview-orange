@@ -5,6 +5,7 @@
  */
 import { io } from 'socket.io-client';
 import fs from 'node:fs';
+import { trpcHeaders, socketAuth } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 
@@ -14,7 +15,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json();
@@ -77,7 +78,7 @@ async function main() {
     metadata: { assistMode: true, difficulty: '3_5_YEARS', lang: 'zh-CN' },
   }, token);
 
-  const s = io(BASE, { auth: { token, locale: 'zh', sessionId: session.id }, transports: ['websocket'], reconnection: false });
+  const s = io(BASE, { auth: socketAuth({ token, locale: 'zh', sessionId: session.id }), transports: ['websocket'], reconnection: false });
   attach(s);
   await wait(700);
 
@@ -87,12 +88,14 @@ async function main() {
   await wait(2600);
   s.emit('perf.ping', { sentAt: Date.now() });
   s.emit('ai.mergePrev', { keepAssistant: true });
-  s.emit('ai.interrupt', { reason: 'user' });
   s.emit('mock.toggleAssist', { assistMode: true });
   s.emit('mock.answer', { answer: '我在电商做订单链路，P99 110ms，用 MySQL 和 Redis。' });
   await wait(2400);
   // stt.inject → 完整 assistant 流（webSearch 假触发已移除）
   s.emit('stt.inject', { text: 'MySQL 的索引为什么用 B+ 树？什么时候回表？' });
+  await wait(300);
+  // 此时 assist 生成必然在途（mock ~2s / 真实更久），interrupt 确定性命中 ai.interrupted
+  s.emit('ai.interrupt', { reason: 'user' });
   await wait(2600);
 
   // STT：真实 ASR（healthz.asr）→ 流式送 16k PCM 实测转写；本地替身 → 沿用 8KB 规则
@@ -140,7 +143,7 @@ async function main() {
       type: 'MOCK_INTERVIEW', resumeId: resumes[0].id, goalId: goals[0].id,
       metadata: { assistMode: true, difficulty: '3_5_YEARS', lang: 'zh-CN' },
     }, token);
-    const c = io(BASE, { auth: { token, locale: 'zh', sessionId: clean.id }, transports: ['websocket'], reconnection: false });
+    const c = io(BASE, { auth: socketAuth({ token, locale: 'zh', sessionId: clean.id }), transports: ['websocket'], reconnection: false });
     let question = 0, assistant = 0, selfSegment = 0;
     c.on('mock.question', () => { question += 1; });
     c.on('ai.message', () => { assistant += 1; });
@@ -163,7 +166,7 @@ async function main() {
     c.disconnect();
   }
 
-  const d = io(`${BASE}/desktop`, { auth: { token, locale: 'zh' }, transports: ['websocket'], reconnection: false });
+  const d = io(`${BASE}/desktop`, { auth: socketAuth({ token, locale: 'zh' }), transports: ['websocket'], reconnection: false });
   attach(d);
   await wait(700);
   const start = await new Promise((res) => d.emit('exam.session.start', { title: '事件矩阵', mode: 'quick', customization: { preset: 'reverse-linked-list' } }, res));
@@ -179,7 +182,11 @@ async function main() {
   d.emit('exam.session.complete', { sessionId: start?.data?.sessionId }, () => {});
   await wait(600);
   s.emit('mock.end', {});
-  await wait(500);
+  // mock 模式瞬时完成；真实模式要等 finalizeSession 的 LLM 报告生成完（可达几十秒）才推送 mock.end
+  await new Promise((resolve) => {
+    const t = setTimeout(resolve, 45_000);
+    s.once('mock.end', () => { clearTimeout(t); resolve(); });
+  });
   s.disconnect();
   d.disconnect();
 

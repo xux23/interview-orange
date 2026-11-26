@@ -4,6 +4,7 @@
  * 运行：node scripts/asr-config-e2e.mjs   （server 需已在 8756 运行；脚本结束会把 DB 覆盖清掉）
  */
 import http from 'node:http';
+import { trpcHeaders } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 const UPSTREAM = Number(process.env.ASR_UPSTREAM_PORT || 8798);
@@ -21,7 +22,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json().catch(() => ({}));
@@ -189,6 +190,9 @@ async function main() {
 
 main().catch((e) => {
   console.error('[e2e] 失败：', e);
+  if (String(e?.message || e).includes('不能指向内网/本机/链路本地地址')) {
+    console.error('提示：自检需要本地假网关，请用 `ML_ALLOW_LOCAL_GATEWAY=1 node server/index.js` 启动服务后重跑');
+  }
   process.exitCode = 1;
   process.exit(1);
 });

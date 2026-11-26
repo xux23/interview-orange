@@ -69,15 +69,21 @@ export const overlayWindow = {
   timer: null,
   lastShown: null, // 最近一次 overlay-shown 载荷（浮窗晚加载错过广播时按请求补发）
 
-  open({ mode = 'interview', sessionId = null, style = {} } = {}) {
+  async open({ mode = 'interview', sessionId = null, style = {} } = {}) {
     this.mode = mode;
-    this.seq = nextShowSeq();
-    const payload = { type: 'overlay-shown', seq: this.seq, mode, sessionId, style };
-    this.lastShown = payload;
+    let seq = nextShowSeq();
     const nat = window.orangeNative;
     if (nat?.showOverlay) {
-      // 原生壳：显示预建的 overlay 窗口；seq 一并发给 Rust，保证 sessionReady 对得上
-      try { nat.showOverlay({ mode, sessionId, seq: this.seq }); } catch { /* ignore */ }
+      // P2-C：以原生返回 seq 为准并回写 localStorage——此前忽略返回值，本地自增与
+      // Rust 侧自增会漂移，导致 sessionReady / release 判定对不上
+      try {
+        const r = await nat.showOverlay({ mode, sessionId, seq });
+        const nativeSeq = Number(r?.seq);
+        if (Number.isFinite(nativeSeq) && nativeSeq > 0) {
+          seq = nativeSeq;
+          localStorage.setItem(SEQ_KEY, String(seq));
+        }
+      } catch { /* ignore */ }
     } else {
       // 浏览器模式：尺寸跟随样式（examWidth/interviewWidth 等；style.width 为旧键兼容）
       const isExam = mode === 'exam';
@@ -89,6 +95,9 @@ export const overlayWindow = {
       }
       this.handle?.focus?.();
     }
+    this.seq = seq;
+    const payload = { type: 'overlay-shown', seq, mode, sessionId, style };
+    this.lastShown = payload;
     publish(payload);
     clearInterval(this.timer);
     this.timer = setInterval(() => publish({ type: 'overlay-heartbeat' }), 5000);

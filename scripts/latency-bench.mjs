@@ -9,6 +9,7 @@
  */
 import { io } from 'socket.io-client';
 import fs from 'node:fs';
+import { trpcHeaders, socketAuth } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -24,7 +25,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json();
@@ -44,7 +45,7 @@ const session = await call('session.createSession', 'mutation', {
   type: 'MOCK_INTERVIEW', resumeId, goalId, metadata: { assistMode: true, lang: 'zh-CN' },
 }, token);
 
-const s = io(BASE, { auth: { token, locale: 'zh', sessionId: session.id }, transports: ['websocket'], reconnection: false });
+const s = io(BASE, { auth: socketAuth({ token, locale: 'zh', sessionId: session.id }), transports: ['websocket'], reconnection: false });
 await wait(700);
 
 /* ── A. 面试辅助答案：TTFT + 完成 ── */
@@ -83,7 +84,7 @@ if (ttfts.length) {
 s.disconnect();
 
 /* ── B. 笔试解题：首事件 + 完成 ── */
-const d = io(`${BASE}/desktop`, { auth: { token, locale: 'zh' }, transports: ['websocket'], reconnection: false });
+const d = io(`${BASE}/desktop`, { auth: socketAuth({ token, locale: 'zh' }), transports: ['websocket'], reconnection: false });
 await wait(600);
 const startAck = await new Promise((res) => d.emit('exam.session.start', { title: '延迟基准', mode: 'quick', customization: {} }, res));
 const shot = fs.readFileSync(new URL('../shots/exam.png', import.meta.url)).toString('base64');

@@ -36,6 +36,9 @@ export default function MockRoom({ user }) {
   const socketRef = useRef(null);
   const bodyRef = useRef(null);
   const startedRef = useRef(false);
+  // P2-B：流式草稿用 ref 保存真值，结束事件里先算值再分别 setState
+  const draftQRef = useRef('');
+  const draftARef = useRef('');
 
   useEffect(() => {
     if (!sessionId) return;
@@ -63,26 +66,27 @@ export default function MockRoom({ user }) {
     });
     socket.on('connect_error', (e) => console.warn('socket error', e.message));
 
-    socket.on('mock.questionStart', () => setDraftQuestion(''));
-    socket.on('mock.question', (chunk) => setDraftQuestion((q) => q + chunk));
+    socket.on('mock.questionStart', () => { draftQRef.current = ''; setDraftQuestion(''); });
+    socket.on('mock.question', (chunk) => { draftQRef.current += chunk; setDraftQuestion(draftQRef.current); });
     socket.on('mock.questionEnd', () => {
-      setDraftQuestion((q) => {
-        if (q) {
-          setItems((list) => [...list, { role: 'INTERVIEWER', content: q }]);
-          publish({ type: 'overlay-ai-text', text: q });
-        }
-        return '';
-      });
+      // P2-B：先算值再分别 setState（不在 updater 内做 setItems/publish，StrictMode 下不会重复）
+      const q = draftQRef.current;
+      draftQRef.current = '';
+      setDraftQuestion('');
+      if (q) {
+        setItems((list) => [...list, { role: 'INTERVIEWER', content: q }]);
+        publish({ type: 'overlay-ai-text', text: q });
+      }
     });
 
-    socket.on('ai.messageStart', () => setDraftAnswer(''));
-    socket.on('ai.message', (chunk) => setDraftAnswer((a) => a + chunk));
+    socket.on('ai.messageStart', () => { draftARef.current = ''; setDraftAnswer(''); });
+    socket.on('ai.message', (chunk) => { draftARef.current += chunk; setDraftAnswer(draftARef.current); });
     socket.on('ai.messageEnd', () => {
-      setDraftAnswer((a) => {
-        // 只把「面试官问题」推给浮窗注入框；AI 答案不覆盖输入框（浮窗自己已收流式答案）
-        if (a) setItems((list) => [...list, { role: 'ASSISTANT', content: a }]);
-        return '';
-      });
+      // 只把「面试官问题」推给浮窗注入框；AI 答案不覆盖输入框（浮窗自己已收流式答案）
+      const a = draftARef.current;
+      draftARef.current = '';
+      setDraftAnswer('');
+      if (a) setItems((list) => [...list, { role: 'ASSISTANT', content: a }]);
     });
     socket.on('audio.permission', () => {});
     // 服务端模型失败（出题/答题）直接推送错误，不再静默降级

@@ -174,8 +174,8 @@ node scripts/socket-events.mjs   # 43 项事件矩阵，含真实转写实测（
 node scripts/asr-separation.mjs  # 双路并发分离（双中文样本）：面试官(Guest-1)/本人(self) 互不混音
 node scripts/real-ai-e2e.mjs     # 真实模型全链路 9 项：出题/答案/笔试视觉解题/改写/LLM 报告
 node scripts/p0p1-verify.mjs     # P0/P1 专项 6 项：押题生成/视觉配色/真转写/热词/岗位推荐/资料生成
-npm run test:ai                  # AI 配置中心 15 项：假网关+热切换+双链路+不可达+回退（会自动 reset）
-npm run test:asr                 # ASR 配置中心 15 项：假音频网关+input_audio 真转写+热切换+回退替身
+npm run test:ai                  # AI 配置中心 15 项：假网关+热切换+双链路+不可达+回退（会自动 reset；需 ML_ALLOW_LOCAL_GATEWAY=1 启动服务）
+npm run test:asr                 # ASR 配置中心 15 项：假音频网关+input_audio 真转写+热切换+回退替身（同上，需 ML_ALLOW_LOCAL_GATEWAY=1）
 ```
 
 ## 8. 常见问题
@@ -187,7 +187,7 @@ npm run test:asr                 # ASR 配置中心 15 项：假音频网关+inp
 | 浮窗打不开 | 用 `启动.bat` 走原生壳；按 `Ctrl+Alt+H` 直接显隐浮窗（无会话时显示空态卡片）；或在主窗点「真实面试浮窗 / 笔试助手」 |
 | **找不到浮窗 / 截图拍不到它** | 按 `Ctrl+Alt+H` 显隐（无会话时显示预览卡片）。浮窗默认**不做**防截屏，能正常截图 |
 | **浮窗变成黑块** | 是因为开了「浮窗防截屏」（设置页）——透明窗口 + WDA 在部分显卡/DWM 下互斥。关掉该项即恢复半透明 |
-| 浮窗看起来是实心不透明 | 确认壳是 Tauri 版（`healthz` 版本 `interview-orange/1.0.0`）；页面 `#overlay` 需带 `.overlay` 类 |
+| 浮窗看起来是实心不透明 | 确认壳是 Tauri 版（`healthz` 版本 `interview-orange/1.1.0`）；页面 `#overlay` 需带 `.overlay` 类 |
 | 浮窗关不掉 | 头部 `×` 关闭、`—` 隐藏，或热键 `Ctrl+Alt+Shift+X`；`Ctrl+Alt+Esc` 紧急隐藏全部窗口 |
 | 截屏黑屏 | 用「粘贴截图」兜底；原生壳下用「截取屏幕」按钮（浮窗区域因 WDA 不会入屏，属预期） |
 | /legacy 白屏/报 Stream closed | 确认服务是新代码（JSONL 协议需重启生效）；刷新页面重试 |

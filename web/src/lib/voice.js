@@ -12,18 +12,37 @@
  */
 
 const WORKLET_SRC = `
+// P2-B：按 AudioContext 实际采样率线性重采样到 16k（服务端固定按 16k 解析）；
+// 保留跨块相位与上一块末样本，避免块边界出现咔哒/音调漂移。
 class Pcm16Sender extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ratio = sampleRate / 16000;
+    this.pos = 0;
+    this.last = 0;
+  }
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
-    if (ch) {
-      const pcm = new Int16Array(ch.length);
-      let sum = 0;
-      for (let i = 0; i < ch.length; i++) {
-        const s = Math.max(-1, Math.min(1, ch[i]));
-        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        sum += s * s;
-      }
-      this.port.postMessage({ pcm: pcm.buffer, level: Math.sqrt(sum / ch.length) }, [pcm.buffer]);
+    if (!ch || !ch.length) return true;
+    const r = this.ratio;
+    const out = [];
+    let sum = 0;
+    let pos = this.pos;
+    while (pos < ch.length) {
+      const i0 = Math.floor(pos);
+      const t = pos - i0;
+      const a = i0 < 0 ? this.last : ch[i0];
+      const b = i0 + 1 < ch.length ? ch[i0 + 1] : ch[ch.length - 1];
+      const s = Math.max(-1, Math.min(1, a + (b - a) * t));
+      out.push(s < 0 ? s * 0x8000 : s * 0x7fff);
+      sum += s * s;
+      pos += r;
+    }
+    this.last = ch[ch.length - 1];
+    this.pos = pos - ch.length;
+    if (out.length) {
+      const pcm = Int16Array.from(out);
+      this.port.postMessage({ pcm: pcm.buffer, level: Math.sqrt(sum / out.length) }, [pcm.buffer]);
     }
     return true;
   }

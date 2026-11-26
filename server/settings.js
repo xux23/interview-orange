@@ -80,6 +80,9 @@ function ipBlocked(ip) {
   return mapped ? ipBlocked(mapped[1]) : false;
 }
 
+// ML_ALLOW_LOCAL_GATEWAY=1 时允许 probe 指向内网/本机网关（仅限本地联调/自检，如官方 e2e 的 127.0.0.1:8799 假网关）。
+// 默认关闭：SSRF 防护对内网/环回地址全拒，行为不变。
+let warnedLocalGateway = false;
 async function assertProbeTarget(baseUrl, label) {
   let u;
   try {
@@ -95,6 +98,14 @@ async function assertProbeTarget(baseUrl, label) {
     throw new Error(`${label} 域名解析失败`);
   }
   if (!infos.length) throw new Error(`${label} 域名解析失败`);
+  if (process.env.ML_ALLOW_LOCAL_GATEWAY === '1') {
+    // 本地联调/自检模式：跳过内网地址拦截（URL 合法性/协议/DNS 解析校验仍然保留）
+    if (!warnedLocalGateway) {
+      warnedLocalGateway = true;
+      console.warn('[security] ML_ALLOW_LOCAL_GATEWAY=1：已放行内网/本机网关地址（仅限本地联调/自检）');
+    }
+    return;
+  }
   for (const { address } of infos) {
     if (ipBlocked(address)) throw new Error(`${label} 不能指向内网/本机/链路本地地址（安全限制）`);
   }
@@ -258,15 +269,25 @@ export function aiSnapshot() {
   };
 }
 
-export function saveAI(patch = {}) {
+export async function saveAI(patch = {}) {
   const clean = sanitizeAI(patch);
-  // 模型/网关锁定：忽略这三项覆盖（用户只填 Key）
+  // 模型/网关锁定：忽略这三项覆盖（用户只填 Key）；先删 baseUrl 再做下面的校验，避免误伤锁定场景
   if (config.lockModels) {
     delete clean.baseUrl;
     delete clean.model;
     delete clean.visionModel;
   }
   if (!Object.keys(clean).length) throw new Error('没有需要保存的字段');
+  // P1-1：保存即校验（此前只在 probe 校验，保存可直接写入私网地址/静默换址复用旧 Key）。
+  // 换 baseUrl 且本次没传 Key 直接拒绝；目标地址按 probe 同一套规则做 DNS/私网校验。
+  // 校验失败直接抛错——不会执行下面的 writeSaved/applySavedAI，配置保持原值。
+  if (clean.baseUrl) {
+    const prevBase = String(config.ai.baseUrl || '').replace(/\/+$/, '');
+    if (clean.baseUrl !== prevBase && !clean.apiKey) {
+      throw new Error('更换网关地址时必须同时填写 API Key（不会把已保存的 Key 发往新地址）');
+    }
+    await assertProbeTarget(clean.baseUrl, 'baseUrl');
+  }
   const merged = { ...savedAI(), ...clean };
   // 只填 Key 的场景：未显式选择 mock 时自动切真实模型
   if (clean.apiKey && merged.provider === 'mock' && patch.provider !== 'mock') merged.provider = 'openai';
@@ -313,7 +334,11 @@ export async function probeAI(input = {}) {
   if (!cand.apiKey) return { ok: false, provider: 'openai', error: 'API Key 为空', checks };
   // P1：换了网关地址又没重新填 Key 时，拒绝把已保存的 Key 发往新地址（防密钥外泄）
   if (clean.baseUrl && clean.baseUrl !== String(config.ai.baseUrl || '').replace(/\/+$/, '') && !input.apiKey) {
-    throw new Error('更换网关地址时必须同时填写 API Key（不会把已保存的 Key 发往新地址）');
+    return {
+      ok: false, provider: 'openai', baseUrl: base,
+      error: '更换网关地址时必须同时填写 API Key（不会把已保存的 Key 发往新地址）',
+      checks: [{ name: 'key', ok: false, detail: '更换 baseUrl 未提供新 Key，拒绝把已保存的 Key 发往新地址' }],
+    };
   }
   await assertProbeTarget(base, 'baseUrl');
 
@@ -426,13 +451,21 @@ export function asrSnapshot() {
   };
 }
 
-export function saveASR(patch = {}) {
+export async function saveASR(patch = {}) {
   const clean = sanitizeASR(patch);
   if (config.lockModels) {
     delete clean.baseUrl;
     delete clean.model;
   }
   if (!Object.keys(clean).length) throw new Error('没有需要保存的字段');
+  // P1-1：与 saveAI 同一套保存校验（换址必须重填 Key + 目标不得是内网/环回）
+  if (clean.baseUrl) {
+    const prevBase = String(config.asr.baseUrl || '').replace(/\/+$/, '');
+    if (clean.baseUrl !== prevBase && !clean.apiKey) {
+      throw new Error('更换网关地址时必须同时填写 API Key（不会把已保存的 Key 发往新地址）');
+    }
+    await assertProbeTarget(clean.baseUrl, 'baseUrl');
+  }
   const merged = { ...savedASR(), ...clean };
   if (clean.apiKey && merged.provider === 'mock' && patch.provider !== 'mock') merged.provider = 'qianwen';
   const nextProvider = merged.provider ?? config.asr.provider;
@@ -498,7 +531,11 @@ export async function probeASR(input = {}) {
   if (!cand.apiKey) return { ok: false, provider: cand.provider, error: 'API Key 为空', checks };
   // P1：更换网关地址又未填 Key 时，拒绝复用已保存 Key
   if (clean.baseUrl && clean.baseUrl !== String(config.asr.baseUrl || '').replace(/\/+$/, '') && !input.apiKey) {
-    throw new Error('更换网关地址时必须同时填写 API Key（不会把已保存的 Key 发往新地址）');
+    return {
+      ok: false, provider: cand.provider, baseUrl: base,
+      error: '更换网关地址时必须同时填写 API Key（不会把已保存的 Key 发往新地址）',
+      checks: [{ name: 'key', ok: false, detail: '更换 baseUrl 未提供新 Key，拒绝把已保存的 Key 发往新地址' }],
+    };
   }
   await assertProbeTarget(base, 'baseUrl');
 

@@ -22,14 +22,13 @@ export default function ExamRoom({ user }) {
   const [history, setHistory] = useState([]);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
+  const [solving, setSolving] = useState(false);
   const socketRef = useRef(null);
   const streamRef = useRef(null);
   const answerRef = useRef('');
-  const questionRef = useRef('');
   const reqIdRef = useRef('');
+  const questionByReqRef = useRef(new Map()); // P2-B2：按 reqId 保存本轮题面（截图题没有题面文本）
   useEffect(() => { reqIdRef.current = reqId; }, [reqId]);
-
-  useEffect(() => { questionRef.current = questionText; }, [questionText]);
 
   useEffect(() => {
     api.query('promptStudio.presets', { lang: locale() }).then((p) => setPresets(p.examPresets || [])).catch(() => {});
@@ -39,48 +38,75 @@ export default function ExamRoom({ user }) {
     const socket = io('/desktop', { auth: { token: getToken(), socketToken: getSocketToken(), locale: locale() }, transports: ['websocket', 'polling'] });
     socketRef.current = socket;
     socket.on('connect', () => {
+      // P1-10：重连优先复用房间持久化的 examSessionId（服务端按 ACTIVE 幂等），避免每次重连新建 ACTIVE 行
+      const storedSid = localStorage.getItem('exam.sessionId') || '';
       socket.emit('exam.session.start', {
+        sessionId: storedSid || undefined,
         title: preset || '笔试答题', goalId: goalId || null, mode,
         customization: { ...customization, preset, codeQuality: mode, lang: locale() }, platform: 'win32',
       }, (ack) => {
         if (ack?.success) {
           setSessionId(ack.data.sessionId);
+          localStorage.setItem('exam.sessionId', ack.data.sessionId);
           setQuota({ isPro: ack.data.isPro, remainingMinutes: ack.data.remainingMinutes });
+        } else {
+          flash(ack?.error?.message || '笔试会话创建失败');
         }
       });
     });
     socket.on('exam.peers', () => {});
+    const isCurrent = (id) => !id || id === reqIdRef.current;
     socket.on('exam.start', ({ reqId: id }) => {
+      reqIdRef.current = id;
       answerRef.current = '';
       setReqId(id);
       setStage('working');
+      setSolving(true);
       setReasoning('');
       setAnswer('');
       publish({ type: 'overlay-exam', stage: 'start', reqId: id });
     });
-    socket.on('exam.progress', ({ stage: s }) => setStage(s || 'working'));
-    socket.on('exam.reasoning', ({ text }) => { setReasoning((r) => r + text); publish({ type: 'overlay-exam', stage: 'reasoning', text }); });
-    socket.on('exam.delta', ({ text }) => {
+    socket.on('exam.progress', ({ stage: s, reqId: id }) => { if (isCurrent(id)) setStage(s || 'working'); });
+    socket.on('exam.reasoning', ({ text, reqId: id }) => {
+      if (!isCurrent(id)) return;
+      setReasoning((r) => r + text);
+      publish({ type: 'overlay-exam', stage: 'reasoning', text });
+    });
+    socket.on('exam.delta', ({ text, reqId: id }) => {
+      if (!isCurrent(id)) return;
       answerRef.current += text;
       setAnswer((a) => a + text);
       publish({ type: 'overlay-exam', stage: 'delta', text });
     });
-    socket.on('exam.end', () => {
+    socket.on('exam.end', ({ reqId: id } = {}) => {
+      if (!isCurrent(id)) return;
       setStage('done');
+      setSolving(false);
       setAnswer(answerRef.current);
       publish({ type: 'overlay-exam', stage: 'end' });
-      // socket 回调在 effect 建立时捕获闭包，必须从 ref 取本轮最终值
-      const q = questionRef.current.trim();
-      setHistory((h) => [...h, { questionText: q || '（截图题）', answer: answerRef.current }]);
+      // P2-B2：按 reqId 取本轮题面（截图题没有文本，用占位符）
+      const q = questionByReqRef.current.get(id) || '（截图题）';
+      setHistory((h) => [...h, { questionText: q, answer: answerRef.current }]);
     });
     socket.on('exam.quota', (q) => setQuota(q));
     // 模型失败（文档 23 错误统一走 exam.error）：行内报错 + 浮窗提示，不再静默降级
-    socket.on('exam.error', ({ message } = {}) => {
+    socket.on('exam.error', ({ message, reqId: id } = {}) => {
+      if (!isCurrent(id)) return;
       const msg = message || '解题失败';
       setStage('idle');
+      setSolving(false);
       setError(msg);
       flash(msg);
       publish({ type: 'overlay-exam', stage: 'error', message: msg });
+    });
+    // P1-9：用户中止（exam.abort）后复位，不停在 working
+    socket.on('exam.aborted', ({ reqId: id } = {}) => {
+      if (!isCurrent(id)) return;
+      setStage('idle');
+      setSolving(false);
+      setAnswer(answerRef.current);
+      flash('已中止本题');
+      publish({ type: 'overlay-exam', stage: 'end' });
     });
     socket.on('connect_error', (e) => console.warn('exam socket error', e.message));
     return () => { socket.removeAllListeners(); socket.disconnect(); streamRef.current?.getTracks?.().forEach((t) => t.stop()); };
@@ -148,9 +174,12 @@ export default function ExamRoom({ user }) {
   }, []);
 
   const solve = () => {
-    if (!socketRef.current) return;
+    // P1-9：前端单飞锁——在途解题期间忽略重复点击，避免多条流交织
+    if (solving) return flash('上一题仍在解题中…');
+    if (!socketRef.current || !socketRef.current.connected) return flash('连接未就绪');
     if (!screenshot && !questionText.trim()) return flash('需要截图或题面');
     setError('');
+    setSolving(true);
     const payload = {
       screenshot, sessionId, mode,
       customization: { ...customization, preset, codeQuality: mode, lang: locale() },
@@ -158,7 +187,14 @@ export default function ExamRoom({ user }) {
       canCaptureWithCompatibility: true, canCaptureGpuChild: false, clientWindows: [],
     };
     socketRef.current.emit('exam.solve', payload, (ack) => {
-      if (ack?.success) setReqId(ack.data.reqId);
+      if (ack?.success) {
+        setReqId(ack.data.reqId);
+        reqIdRef.current = ack.data.reqId;
+        questionByReqRef.current.set(ack.data.reqId, questionText.trim() || '（截图题）');
+      } else {
+        setSolving(false);
+        flash(ack?.error?.message || '解题请求被拒绝');
+      }
     });
   };
 
@@ -168,6 +204,8 @@ export default function ExamRoom({ user }) {
 
   const finish = () => {
     socketRef.current?.emit('exam.session.complete', { sessionId }, () => {});
+    // P1-10：主动结束即清掉房间持久化会话，下一次进入房间新建
+    try { localStorage.removeItem('exam.sessionId'); } catch { /* ignore */ }
     overlayWindow.hide();
     setTimeout(() => window.close(), 400);
   };
@@ -200,7 +238,7 @@ export default function ExamRoom({ user }) {
           <textarea value={questionText} onChange={(e) => setQuestionText(e.target.value)} placeholder="例如：求两数之和的下标…" />
         </div>
         {screenshot && <img src={screenshot} alt="screenshot" style={{ width: '100%', borderRadius: 8, border: '1px solid var(--line)' }} />}
-        <button className="btn primary" onClick={solve}>解题（扣 2 分钟）</button>
+        <button className="btn primary" disabled={solving} onClick={solve}>{solving ? '解题中…' : '解题（扣 2 分钟）'}</button>
         <small className="muted">每次截图解题按官方口径扣 2 分钟；结果同步到浮窗。</small>
         <span className="spacer" />
         <div className="tiny muted">session：<span className="mono">{sessionId || '—'}</span></div>

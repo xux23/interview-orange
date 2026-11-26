@@ -81,6 +81,18 @@ export default function MainApp({ user: initialUser }) {
   const [ann, setAnn] = useState(null);
   const [pendingNotice, setPendingNotice] = useState(null);
   const [countdown, setCountdown] = useState(5);
+  const [hotkeyStatus, setHotkeyStatus] = useState(null);
+
+  // P1-12：启动时主动拉一次热键实际注册状态（失败项在隐蔽页标红，不再无条件宣称可用）
+  useEffect(() => {
+    let cancelled = false;
+    window.__ORANGE_INVOKE__?.('hotkeys.status')?.then((st) => {
+      if (cancelled) return;
+      setHotkeyStatus(st);
+      if (st?.failed?.length) console.warn('[hotkeys] 以下热键未注册：', st.failed);
+    }).catch(() => { /* 浏览器模式无原生壳 */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // 文档 06 §5：公告 5 分钟轮询、使用须知弹窗（5s 倒计时确认）
   useEffect(() => {
@@ -222,7 +234,7 @@ export default function MainApp({ user: initialUser }) {
           {tab === 'bank' && <BankPage notice={notice} />}
           {tab === 'material' && <MaterialPage notice={notice} />}
           {tab === 'prompt' && <PromptPage notice={notice} />}
-          {tab === 'stealth' && <StealthPage notice={notice} />}
+          {tab === 'stealth' && <StealthPage notice={notice} hotkeys={hotkeyStatus} />}
           {tab === 'settings' && <SettingsPage user={user} notice={notice} reloadUser={reloadUser} />}
         </div>
       </main>
@@ -1094,8 +1106,19 @@ function PromptPage({ notice }) {
 }
 
 /* ───────────── 隐蔽与防检测 ───────────── */
-function StealthPage({ notice }) {
+const HK_LABELS = {
+  panic: 'panic 隐藏/恢复全部窗口',
+  'toggle-overlay': '浮窗显示/隐藏',
+  'close-overlay': '关闭所有浮窗',
+  quit: '退出桌面端',
+};
+
+function StealthPage({ notice, hotkeys }) {
   const [state, setState] = useState(null);
+  const [hk, setHk] = useState(hotkeys || null);
+  const loadHotkeys = () => window.__ORANGE_INVOKE__?.('hotkeys.status')?.then(setHk).catch(() => { /* 浏览器模式 */ });
+  useEffect(() => { setHk(hotkeys || null); }, [hotkeys]);
+  useEffect(() => { loadHotkeys(); }, []);
   const [disguise, setDisguise] = useState(localStorage.getItem('stealth.disguiseTitle') || '');
   const [busy, setBusy] = useState(false);
   const [audio, setAudio] = useState({ running: false, level: 0, devices: null });
@@ -1231,18 +1254,26 @@ function StealthPage({ notice }) {
           </div>
           <div className="divider" />
           <b>panic 紧急隐藏</b>
-          <small className="muted">全局热键 <span className="mono">Ctrl+Alt+Esc</span>：一键隐藏全部窗口（并开启防截屏），再按一次恢复。</small>
+          <small className="muted">
+            全局热键 <span className="mono">{hk?.hotkey || '（未注册）'}</span>：一键隐藏全部窗口（并开启防截屏），再按一次恢复。
+            {isNative && !hk?.hotkey && <span style={{ color: '#c0392b' }}> 当前未注册成功，请到设置页重新保存或关闭其它实例。</span>}
+          </small>
           <div className="row">
-            <button className="btn" disabled={!isNative} onClick={async () => { const n = await panicToggle(); notice(n ? `已隐藏 ${n} 个窗口（Ctrl+Alt+Esc 恢复）` : '已恢复'); load(); }}>立即隐藏 / 恢复</button>
+            <button className="btn" disabled={!isNative} onClick={async () => { const n = await panicToggle(); notice(n ? `已隐藏 ${n} 个窗口（${hk?.hotkey || '热键'} 恢复）` : '已恢复'); load(); }}>立即隐藏 / 恢复</button>
           </div>
           <div className="divider" />
-          <b>热键速查</b>
+          <b>热键速查（实际注册状态）</b>
           <div className="tiny muted col" style={{ gap: 2 }}>
-            <div><span className="mono">Ctrl+Alt+Esc</span> panic 隐藏/恢复全部窗口</div>
-            <div><span className="mono">Ctrl+Alt+H</span> 浮窗显示/隐藏</div>
-            <div><span className="mono">Ctrl+Alt+Shift+X</span> 关闭所有浮窗</div>
-            <div><span className="mono">Ctrl+Alt+Shift+Q</span> 退出桌面端</div>
+            {hk?.items?.length ? hk.items.map((it) => (
+              <div key={`${it.action}-${it.id}`} style={it.ok ? undefined : { color: '#c0392b' }}>
+                <span className="mono">{it.accel || '—'}</span> {HK_LABELS[it.action] || it.action}
+                {it.ok ? '（已注册）' : `（未注册：可能被其它实例或程序占用，Win32 错误 ${it.error ?? '?'}）`}
+              </div>
+            )) : <div>正在读取热键状态…（浏览器模式无可注册热键）</div>}
           </div>
+          {hk?.failed?.length > 0 && (
+            <small style={{ color: '#c0392b' }}>有 {hk.failed.length} 项热键未注册；关闭占用它们的程序后到设置页重新保存即可恢复。</small>
+          )}
           {state?.browser && <small className="muted">浏览器模式：仅热键中「浮窗显隐」由页面内 Esc 双击提供，其余需桌面端。</small>}
         </div>
       </div>
@@ -1428,10 +1459,11 @@ function SettingsPage({ user, notice, reloadUser }) {
       // P1-4：保存后把 panic 热键热注册进原生壳（不重启即生效），并回显实际注册结果
       try {
         const r = await window.orangeNative?.hotkeys?.([{ accel: panic, action: 'panic' }]);
-        const items = r?.registered || [];
+        const items = (r?.registered || []).filter((i) => i.ok !== false);
+        const failed = r?.failed || [];
         notice(items.length > 0
-          ? `设置已保存；panic 热键已注册：${items.map((i) => i.accel).join('、')}`
-          : `设置已保存；panic 热键未注册（无修饰键组合如 Esc+Esc 只能在浮窗内双击 Esc 触发）`);
+          ? `设置已保存；panic 热键已注册：${items.map((i) => i.accel).join('、')}${failed.length ? `；另有 ${failed.length} 项被占用未注册` : ''}`
+          : `设置已保存；panic 热键未注册${failed.length ? '（可能被其它实例占用）' : '（无修饰键组合如 Esc+Esc 只能在浮窗内双击 Esc 触发）'}`);
       } catch (e) {
         notice(`设置已保存（客户端 1s 防抖提交）；热键注册失败：${e.message}`);
       }

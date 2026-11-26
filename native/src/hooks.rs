@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -26,6 +26,8 @@ static HOTKEY_OVERRIDES: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
 static HOTKEY_HWND: Mutex<isize> = Mutex::new(0);
 /// 当前实际注册成功的热键：(id, 动作名, 加速键文本)，供 wnd_proc 反查与 hotkeys.status 返回
 static REGISTERED: Mutex<Vec<(i32, String, String)>> = Mutex::new(Vec::new());
+/// P1-12：注册失败项：(id, 动作名, 加速键文本, Win32 错误码)，供前端显式提示占用
+static FAILED: Mutex<Vec<(i32, String, String, u32)>> = Mutex::new(Vec::new());
 /// register_all 完成代际：set_hotkeys 投递指令后等它 +1，同步拿到注册结果
 static REGISTER_GEN: Mutex<u64> = Mutex::new(0);
 /// 焦点钩子线程的消息窗口句柄；0 表示线程尚未就绪（set_focus_hook 经它投递安装/卸载指令）
@@ -148,6 +150,7 @@ unsafe fn register_all(hwnd: HWND) -> Vec<(i32, String, String)> {
     for (id, _, _) in &old {
         let _ = UnregisterHotKey(hwnd, *id);
     }
+    let mut failures: Vec<(i32, String, String, u32)> = Vec::new();
     let overrides = HOTKEY_OVERRIDES.lock().map(|g| g.clone()).unwrap_or_default();
     let mut ok_list: Vec<(i32, String, String)> = Vec::new();
     for (id, action, _mods, _vk, default_accel) in default_hotkeys() {
@@ -168,7 +171,11 @@ unsafe fn register_all(hwnd: HWND) -> Vec<(i32, String, String)> {
                 println!("[hotkey] {action} (id={id}) 「{accel}」已注册");
                 ok_list.push((id, action.to_string(), accel));
             }
-            Err(_) => println!("[hotkey] {action} (id={id}) 「{accel}」注册失败（可能被占用）"),
+            Err(_) => {
+                let code = GetLastError().0;
+                println!("[hotkey] {action} (id={id}) 「{accel}」注册失败（Win32 错误 {code}，可能被其它实例占用）");
+                failures.push((id, action.to_string(), accel, code));
+            }
         }
     }
     for (id, action, accel) in CUSTOM_HOTKEYS.lock().map(|g| g.clone()).unwrap_or_default() {
@@ -186,11 +193,18 @@ unsafe fn register_all(hwnd: HWND) -> Vec<(i32, String, String)> {
                 println!("[hotkey] 自定义 {action} (id={id}) 「{accel}」已注册");
                 ok_list.push((id, action, accel));
             }
-            Err(_) => println!("[hotkey] 自定义 {action} (id={id}) 「{accel}」注册失败（可能被占用）"),
+            Err(_) => {
+                let code = GetLastError().0;
+                println!("[hotkey] 自定义 {action} (id={id}) 「{accel}」注册失败（Win32 错误 {code}）");
+                failures.push((id, action, accel, code));
+            }
         }
     }
     if let Ok(mut g) = REGISTERED.lock() {
         *g = ok_list.clone();
+    }
+    if let Ok(mut g) = FAILED.lock() {
+        *g = failures;
     }
     if let Ok(mut g) = REGISTER_GEN.lock() {
         *g += 1;
@@ -347,15 +361,24 @@ pub fn set_hotkeys(list: &Value) -> bool {
 /// hotkeys.status：返回真实注册结果（不写死）
 pub fn hotkey_status() -> Value {
     let registered = REGISTERED.lock().map(|g| g.clone()).unwrap_or_default();
+    let failed = FAILED.lock().map(|g| g.clone()).unwrap_or_default();
     let panic = registered
         .iter()
         .find(|(_, a, _)| a == "panic")
         .map(|(_, _, accel)| accel.clone());
+    let mut items: Vec<Value> = registered.iter().map(|(id, a, accel)| json!({
+        "id": id, "action": a, "accel": accel, "ok": true,
+    })).collect();
+    // P1-12：失败项也列进 items（ok=false + Win32 错误码），前端据此标红/置灰
+    items.extend(failed.iter().map(|(id, a, accel, code)| json!({
+        "id": id, "action": a, "accel": accel, "ok": false, "error": code,
+    })));
     json!({
         "registered": !registered.is_empty(),
         "hotkey": panic.unwrap_or_default(),
-        "items": registered.iter().map(|(id, a, accel)| json!({
-            "id": id, "action": a, "accel": accel,
+        "items": items,
+        "failed": failed.iter().map(|(id, a, accel, code)| json!({
+            "id": id, "action": a, "accel": accel, "error": code,
         })).collect::<Vec<_>>(),
     })
 }

@@ -6,6 +6,7 @@
  */
 import { io } from 'socket.io-client';
 import fs from 'node:fs';
+import { trpcHeaders, socketAuth } from './lib/local-auth.mjs';
 
 const BASE = process.env.ML_BASE || 'http://127.0.0.1:8756';
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -19,7 +20,7 @@ async function call(name, kind, input, token) {
     : `${BASE}/trpc/${name}`;
   const res = await fetch(url, {
     method: kind === 'query' ? 'GET' : 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json', ...trpcHeaders(), ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: kind === 'query' ? undefined : JSON.stringify({ json: input || {} }),
   });
   const json = await res.json();
@@ -82,7 +83,7 @@ ok('鉴权', `user=${user.phone}`);
     type: 'MOCK_INTERVIEW', resumeId: resumes[0].id, goalId: goals[0].id,
     metadata: { assistMode: true, difficulty: '3_5_YEARS', lang: 'zh-CN' },
   }, token);
-  const s = io(BASE, { auth: { token, locale: 'zh', sessionId: session.id }, transports: ['websocket'], reconnection: false });
+  const s = io(BASE, { auth: socketAuth({ token, locale: 'zh', sessionId: session.id }), transports: ['websocket'], reconnection: false });
   const qStart = Date.now();
   let question = '', questionMs = 0, answer = '', answerMs = 0, aStart = 0;
   s.on('mock.question', (c) => { question += c; });
@@ -153,7 +154,7 @@ ok('鉴权', `user=${user.phone}`);
     type: 'MOCK_INTERVIEW', resumeId: resumes[0].id, goalId: goals[0].id,
     metadata: { assistMode: true, lang: 'zh-CN' },
   }, token).catch(() => null);
-  const d = io(`${BASE}/desktop`, { auth: { token, locale: 'zh' }, transports: ['websocket'], reconnection: false });
+  const d = io(`${BASE}/desktop`, { auth: socketAuth({ token, locale: 'zh' }), transports: ['websocket'], reconnection: false });
   await wait(600);
   const start = await new Promise((res) => d.emit('exam.session.start', { title: '真实视觉解题', mode: 'quick', customization: {} }, res));
   const examSessionId = start?.data?.sessionId;

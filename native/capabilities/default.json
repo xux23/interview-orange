@@ -1,11 +1,22 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗与浮窗：页面来自本地服务（http://127.0.0.1:8756），Tauri v2 对远程域默认禁 IPC，须显式放行",
+  "description": "主窗/浮窗/房间窗：页面来自本地服务（正式 8756；18757 为隔离验收端口），Tauri v2 对远程域默认禁 IPC，须显式放行。remote 只放行本机回环的这两个端口。",
   "local": true,
-  "windows": ["main", "overlay", "web-*"],
+  "windows": [
+    "main",
+    "overlay",
+    "web-*"
+  ],
   "remote": {
-    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+    "urls": [
+      "http://127.0.0.1:8756",
+      "http://localhost:8756",
+      "http://127.0.0.1:18757"
+    ]
   },
-  "permissions": ["core:default", "shell-ipc"]
+  "permissions": [
+    "core:default",
+    "shell-ipc"
+  ]
 }

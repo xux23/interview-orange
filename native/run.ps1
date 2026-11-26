@@ -32,10 +32,16 @@ $Port = [int]$env:ML_PORT
 function Test-Server {
   try { return (Invoke-WebRequest "http://127.0.0.1:$Port/healthz" -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { return $false }
 }
-if (-not $NoServer -and -not (Test-Server)) {
-  Write-Host '[run] 启动本地服务…'
-  Start-Process -FilePath 'node' -ArgumentList 'server/index.js' -WorkingDirectory $root -WindowStyle Hidden | Out-Null
-  for ($i = 0; $i -lt 40 -and -not (Test-Server); $i++) { Start-Sleep -Milliseconds 500 }
+if (-not $NoServer) {
+  if (-not (Test-Server)) {
+    Write-Host '[run] 启动本地服务…'
+    Start-Process -FilePath 'node' -ArgumentList 'server/index.js' -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+    for ($i = 0; $i -lt 40 -and -not (Test-Server); $i++) { Start-Sleep -Milliseconds 500 }
+    # P2-C：只等待不校验会带着未就绪的服务启动原生壳，这里显式失败退出（与 启动.ps1 一致）
+    if (-not (Test-Server)) {
+      throw "[run] 本地服务启动失败：http://127.0.0.1:$Port/healthz 在 20s 内未就绪（查看 data/server.err.log 或手动 node server/index.js）"
+    }
+  }
 }
 
 # 2) 构建环境（仅本进程）

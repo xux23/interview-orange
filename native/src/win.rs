@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, SetWindowDisplayAffinity,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, SetWindowDisplayAffinity,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
     SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
     HWND_TOPMOST, GWL_EXSTYLE,
@@ -67,7 +67,9 @@ const FEATURE_KEYS: &[&str] = &[
 const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
 const WS_EX_APPWINDOW: isize = 0x0004_0000;
 const WS_EX_TRANSPARENT: isize = 0x0000_0020;
-const WS_EX_LAYERED: isize = 0x0008_0000 - 0x0008_0000; // 占位：不改变分层属性
+// 注：WS_EX_TRANSPARENT 的点击穿透只在分层窗口上可靠；浮窗由 transparent(true) 创建，
+// 本身已是分层窗口，SetWindowLongPtrW 改样式后配合 SetWindowPos(FRAMECHANGED) 即可生效，
+// 不需要再额外设置 WS_EX_LAYERED（此前那个 0 值占位是无效代码，已删除）。
 
 pub struct AppState {
     pub hwnds: HashMap<String, isize>,
@@ -198,7 +200,32 @@ pub fn set_hwnd(state: &Mutex<AppState>, label: &str, hwnd: isize) {
     state.lock().unwrap_or_else(|e| e.into_inner()).hwnds.insert(label.to_string(), hwnd);
 }
 
+/// P1-11：窗口销毁时移除登记，并把它从 panic 隐藏列表里去掉
+pub fn remove_hwnd(state: &Mutex<AppState>, label: &str) {
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = st.hwnds.remove(label) {
+        st.hidden_by_panic.retain(|x| *x != h);
+    }
+}
+
+/// P1-11：句柄有效性惰性清理——窗口销毁事件在部分平台/关闭路径下不保证送达，
+/// 遍历前先用 IsWindow 剔除失效句柄，保证 win.list/panic/伪装不残留、不报错。
+fn prune_dead_hwnds(state: &Mutex<AppState>) {
+    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+    let dead: Vec<isize> = st
+        .hwnds
+        .values()
+        .copied()
+        .filter(|h| unsafe { !IsWindow(HWND(*h as *mut core::ffi::c_void)).as_bool() })
+        .collect();
+    if !dead.is_empty() {
+        st.hwnds.retain(|_, h| !dead.contains(h));
+        st.hidden_by_panic.retain(|h| !dead.contains(h));
+    }
+}
+
 fn hwnd_of(state: &Mutex<AppState>, label: &str) -> Option<HWND> {
+    prune_dead_hwnds(state);
     state
         .lock().unwrap_or_else(|e| e.into_inner())
         .hwnds
@@ -297,6 +324,7 @@ pub fn toggle_overlay(state: &Mutex<AppState>) -> bool {
 }
 
 pub fn panic_toggle(state: &Mutex<AppState>) {
+    prune_dead_hwnds(state);
     // 小项3：features.set 的 stealth.panic=false 时 panic 热键不响应（仅存储以外的真实联动）
     let enabled = state
         .lock()
@@ -358,6 +386,19 @@ pub fn set_skip_taskbar(state: &Mutex<AppState>, label: &str, enable: bool) -> b
             ex & !WS_EX_TOOLWINDOW
         };
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+        // P2-C：改扩展样式后必须发 FRAMECHANGED，任务栏/边框样式才会立即生效
+        let _ = SetWindowPos(
+            hwnd,
+            HWND(core::ptr::null_mut()),
+            0,
+            0,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                | windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED,
+        );
     }
     true
 }
@@ -373,13 +414,25 @@ pub fn set_interactive(state: &Mutex<AppState>, label: &str, interactive: bool) 
         } else {
             ex | WS_EX_TRANSPARENT
         };
-        let _ = WS_EX_LAYERED;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND(core::ptr::null_mut()),
+            0,
+            0,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                | windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED,
+        );
     }
     true
 }
 
 pub fn disguise_title(state: &Mutex<AppState>, title: &str) -> bool {
+    prune_dead_hwnds(state);
     let targets: Vec<isize> = state.lock().unwrap_or_else(|e| e.into_inner()).hwnds.values().copied().collect();
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
     let mut ok = false;
@@ -1013,6 +1066,7 @@ pub fn handle_ipc(
             Some((id, true, json!({ "visible": show })))
         }
         "overlay.close" => {
+            // 说明：只隐藏不销毁（窗口复用，下次 showOverlay 直接显示），因此同步 overlay_visible
             if let Some(h) = hwnd_of(state, "overlay") {
                 show_window(h, false);
             }
@@ -1040,6 +1094,8 @@ pub fn handle_ipc(
                 "focusHook": st.focus_enabled,
                 "overlaySeq": st.seq,
                 "lastReadySeq": st.last_ready_seq,
+                // 附加字段：浮窗当前是否可见（供 UI/验收观测，window.close 会同步置 false）
+                "overlayVisible": st.overlay_visible,
             })))
         }
         "stealth.set" => {
@@ -1092,6 +1148,7 @@ pub fn handle_ipc(
             }))
         }
         "win.list" => {
+            prune_dead_hwnds(state);
             let st = state.lock().unwrap_or_else(|e| e.into_inner());
             Some((id, true, json!(st.hwnds.keys().cloned().collect::<Vec<_>>())))
         }
@@ -1124,10 +1181,18 @@ pub fn handle_ipc(
             let ok = crate::hooks::set_hotkeys(&list);
             // 返回真实注册结果（P1-4）：前端用它展示「实际生效的热键」
             let status = crate::hooks::hotkey_status();
+            let items = status.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            // P1-12：registered 只回成功项；失败项单独回给前端标红
+            let registered: Vec<Value> = items
+                .iter()
+                .filter(|i| i.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+                .cloned()
+                .collect();
             Some((id, true, json!({
                 "ok": ok,
                 "count": list.as_array().map(|a| a.len()).unwrap_or(0),
-                "registered": status.get("items").cloned().unwrap_or(json!([])),
+                "registered": registered,
+                "failed": status.get("failed").cloned().unwrap_or(json!([])),
             })))
         }
         "crash.recovery" => {
@@ -1164,7 +1229,14 @@ pub fn handle_ipc(
             let zones = args.get("zones").cloned().unwrap_or(json!([]));
             let count = zones.as_array().map(|a| a.len()).unwrap_or(0);
             state.lock().unwrap_or_else(|e| e.into_inner()).zones = zones.as_array().cloned().unwrap_or_default();
-            Some((id, true, json!({ "stored": true, "count": count })))
+            // P2-C：点击穿透需要 WM_NCHITTEST 返回 HTTRANSPARENT（需子类化窗口过程），当前未实现；
+            // 明确回 unsupported，别让前端把「已登记」误当成「已生效」。
+            Some((id, true, json!({
+                "status": "unsupported",
+                "stored": true,
+                "count": count,
+                "reason": "分区已登记，但点击穿透（WM_NCHITTEST/HTTRANSPARENT）尚未实现，不生效",
+            })))
         }
         /* cmd_relaunch：真正重启（spawn 自身 + exit(0)），绝不返回假成功 */
         "native.relaunch" => {
@@ -1182,8 +1254,13 @@ pub fn handle_ipc(
         }
         "window.close" => {
             let target = args.get("label").and_then(|x| x.as_str()).unwrap_or("overlay");
+            // 说明：这里只隐藏不销毁（窗口可复用），因此必须同步 overlay_visible，
+            // 否则后续 toggle/show 的可见性判断会被陈旧状态带偏（P2-C）
             if let Some(h) = hwnd_of(state, target) {
                 show_window(h, false);
+            }
+            if target == "overlay" {
+                state.lock().unwrap_or_else(|e| e.into_inner()).overlay_visible = false;
             }
             Some((id, true, json!({ "closed": target })))
         }
