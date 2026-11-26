@@ -30,6 +30,7 @@ jobs:
         with:
           node-version: 22
       - run: npm ci --no-audit --no-fund
+      - run: npm run build   # public/ 不入库（.gitignore），smoke 必须先构建前端，否则 GET / 503
       - name: 启动服务并验证鉴权闸门
         run: |
           ML_PORT=8799 ML_DATA_DIR="$PWD/.ci-data" node server/index.js &
